@@ -42,12 +42,25 @@ equivalently the lam-weighted least squares problem
 
 Because sum_i w_{a,i} = 0 for every order, A @ 1 = 0: the solution is unique
 only up to S -> S + c*1, i.e. up to a common rescaling of all prices.  That
-null direction is exactly the choice of numeraire and is fixed by one linear
-constraint, pi . S = g.
+null direction is exactly the choice of numeraire.  More generally, ker(A) is
+the set of price directions no order responds to, which also covers any asset
+nobody quotes this step.
 
-Assets nobody quotes this step leave A rank-deficient.  A small ridge term
-pulls those coordinates to their previous log-price (a multiplicative "price
-unchanged", which is the right default in log space).
+The system is solved in INCREMENT form, which makes all of that exact:
+
+    r_prev = b - A S_prev          net value flow at the incoming prices
+    delta  = A^+ r_prev            minimum-norm correction
+    S      = S_prev + delta + c*1  c restores the gauge
+
+Three facts make this leak-free:
+
+  * r_prev = W^T Lam f_prev lies in range(A) by construction, so A A^+ r_prev
+    = r_prev and the clearing residual b - A S is zero to machine precision;
+  * the minimum-norm delta has no component in ker(A), so directions nobody
+    trades — including unquoted assets — keep their previous log-price exactly,
+    with no regularisation parameter to tune;
+  * W @ 1 = 0, so the gauge shift c*1 is invisible to every order and cannot
+    disturb the flows.
 
 UNITS
 -----
@@ -149,17 +162,14 @@ class ClearingReport:
     prices: dict[str, float]
     log_prices: dict[str, float]
     fills: list[Fill]
-    net_quantity_flow: dict[str, float]   # should be ~0 for every asset
+    net_quantity_flow: dict[str, float]   # ~0 for every asset
     net_value_flow: dict[str, float]      # residual of the clearing condition
     gross_notional: float                 # sum of |notional| over fills
-    max_value_imbalance: float            # absorbed by the house, see below
-    house_flow: dict[str, float]          # quantities the house took to close
-                                          # the residual; exactly minus the
-                                          # orders' net flow, so no asset is
-                                          # created or destroyed
+    max_value_imbalance: float            # clearing residual; ~machine zero
+                                          # unless the book is near-degenerate
+    rank: int                             # number of price directions the book
+                                          # actually determines this step
     cap_iterations: int                   # rounds of lambda tightening used
-    gauge_multiplier: float               # KKT multiplier on the gauge; ~0 when
-                                          # the book is consistent with it
 
 
 # --------------------------------------------------------------------------- #
@@ -181,9 +191,8 @@ class Exchange:
         prices: Mapping[str, float],
         unit_of_account: str | Mapping[str, float] = None,
         unit_price: float = 1.0,
-        ridge: float = 1e-9,
+        rank_tol: float = 1e-12,
         weight_tol: float = 1e-9,
-        house_account: str = "__house__",
     ):
         """
         assets          : the universe, cash/currencies included.
@@ -194,26 +203,21 @@ class Exchange:
                           the money unit in which `lam`, notionals and marks are
                           expressed.  Defaults to the first asset.
         unit_price      : the pinned price, normally 1.0.
-        ridge           : relative Tikhonov weight pulling unquoted assets to
-                          their previous price.  Scaled internally by the size
-                          of the book, so it is dimensionless.
+        rank_tol        : relative cutoff on the eigenvalues of A used to decide
+                          which price directions the book determines.  A
+                          direction below the cutoff is treated as untraded and
+                          keeps its previous price.  This is a rank decision,
+                          not an error knob: directions above the cutoff are
+                          solved exactly.
         weight_tol      : tolerance for the sum(w) == 0 check.
-        house_account   : name of the account that absorbs the residual left by
-                          the ridge.  The ridge acts as a fictitious quote at
-                          the previous price, and unlike a real order it is not
-                          self-financing, so someone has to take the other side.
-                          Making that explicit keeps quantity conservation
-                          exact; the size of this account is a direct measure of
-                          how much the regularisation is distorting the book.
         """
         if len(set(assets)) != len(assets):
             raise ValueError("duplicate asset names")
         self.assets = list(assets)
         self.index = {a: i for i, a in enumerate(self.assets)}
         self.n = len(self.assets)
-        self.ridge = float(ridge)
+        self.rank_tol = float(rank_tol)
         self.weight_tol = float(weight_tol)
-        self.house_account = house_account
 
         missing = set(self.assets) - set(prices)
         if missing:
@@ -231,8 +235,9 @@ class Exchange:
             for a, x in unit_of_account.items():
                 pi[self._i(a)] = float(x)
         if abs(pi.sum()) < 1e-12:
-            # pi must have a component along 1, otherwise it cannot pin the
-            # price level at all (the free direction is exactly 1).
+            # 1 is always in ker(A), so pi must have a component along it;
+            # otherwise the gauge cannot pin the price level at all, and the
+            # projection used in _solve would be degenerate.
             raise ValueError("unit_of_account weights must not sum to zero")
         self._pi = pi
         self._g = math.log(unit_price)
@@ -244,7 +249,7 @@ class Exchange:
         self.t = 0.0
         self._next_oid = 1
         self._live: dict[int, _LiveOrder] = {}
-        self.balances: dict[str, dict[str, float]] = {house_account: {}}
+        self.balances: dict[str, dict[str, float]] = {}
 
     # ---------------------------------------------------------------- helpers
 
@@ -397,35 +402,59 @@ class Exchange:
                 changed = True
         return out, changed
 
-    def _solve(self, orders: list[_LiveOrder], lams: np.ndarray) -> tuple[np.ndarray, float]:
-        """Solve the gauge-constrained, ridge-regularised clearing system.
+    def _solve(self, orders: list[_LiveOrder],
+               lams: np.ndarray) -> tuple[np.ndarray, int]:
+        """Clear the book.  Returns the new log-prices and the book's rank.
 
-            minimise  sum_a lam_a (w_a.S - log z_a)^2 + eps ||S - S_prev||^2
-            s.t.      pi . S = g
+        Solved as an increment from the incoming prices:
 
-        via the KKT system
-            [ A+eps*I   pi ] [ S  ]   [ b + eps*S_prev ]
-            [ pi^T       0 ] [ mu ] = [        g       ]
+            r_prev = b - A S_prev      net value flow at the old prices
+            delta  = A^+ r_prev        minimum-norm correction
+            S      = S_prev + delta    then shifted to restore the gauge
+
+        A is symmetric PSD, so its eigendecomposition gives A^+ directly.
+        Eigen-directions below `rank_tol` are the ones no order responds to;
+        delta is zero there, which is exactly "keep the previous price" and
+        needs no regularisation term.  Since r_prev lies in range(A) by
+        construction, discarding those directions costs nothing.
         """
         n = self.n
         A = np.zeros((n, n))
-        b = np.zeros(n)
+        r_prev = np.zeros(n)
         for lo, lam in zip(orders, lams):
             A += lam * np.outer(lo.w, lo.w)
-            b += lam * lo.log_z * lo.w
+            # value flow this order would push at the incoming prices
+            r_prev += lam * (lo.log_z - lo.w @ self.S) * lo.w
 
-        # ridge scaled to the size of the book, so `self.ridge` is dimensionless
-        scale = max(np.trace(A) / n, 1.0)
-        eps = self.ridge * scale
+        # eigh is exact for symmetric matrices and returns ascending values
+        vals, vecs = np.linalg.eigh(A)
+        cutoff = self.rank_tol * max(vals[-1], 0.0) if n else 0.0
+        keep = vals > cutoff
+        rank = int(np.count_nonzero(keep))
 
-        M = np.zeros((n + 1, n + 1))
-        M[:n, :n] = A + eps * np.eye(n)
-        M[:n, n] = self._pi
-        M[n, :n] = self._pi
-        rhs = np.concatenate([b + eps * self.S, [self._g]])
+        delta = np.zeros(n)
+        if rank:
+            V = vecs[:, keep]
+            delta = V @ ((V.T @ r_prev) / vals[keep])
 
-        sol = np.linalg.solve(M, rhs)
-        return sol[:n], float(sol[n])
+        # `delta` above solves the flows, but its component inside ker(A) is an
+        # arbitrary Euclidean artefact: it can move an untraded asset relative
+        # to the numeraire even though no order referenced either.  We are free
+        # to add anything from ker(A), since no order can feel it, so add the
+        # smallest such correction that restores the gauge pi . S = g.
+        #
+        # That correction points along the projection of pi onto ker(A), which
+        # automatically leaves untraded directions alone.  When every asset is
+        # quoted, ker(A) = span(1) and this reduces to a plain rescaling of all
+        # prices.
+        K = vecs[:, ~keep]
+        if K.shape[1]:
+            q = K @ (K.T @ self._pi)                 # projection of pi onto ker
+            denom = float(self._pi @ q)              # = ||K^T pi||^2 > 0
+            delta = delta - (float(self._pi @ delta) / denom) * q
+
+        S_new = self.S + delta
+        return S_new, rank
 
     def step(self, dt: float = 1.0) -> ClearingReport:
         """Advance the exchange by dt: clear, fill, settle."""
@@ -438,12 +467,12 @@ class Exchange:
         lams, _ = self._tighten(orders, lams, self.S, dt)
         iters = 0
         for iters in range(1, self._MAX_CAP_ITERS + 1):
-            S_new, mu = self._solve(orders, lams)
+            S_new, rank = self._solve(orders, lams)
             lams, changed = self._tighten(orders, lams, S_new, dt)
             if not changed:
                 break
         else:
-            S_new, mu = self._solve(orders, lams)
+            S_new, rank = self._solve(orders, lams)
         P = np.exp(S_new)
 
         fills: list[Fill] = []
@@ -477,17 +506,6 @@ class Exchange:
             fills.append(Fill(order_id=lo.oid, agent=lo.spec.agent, f=f,
                               notional=V, quantities=qmap))
 
-        # The ridge behaves like a quote at the previous price that is not
-        # self-financing, so the orders' flows do not net to exactly zero.  The
-        # house takes the other side, which makes conservation exact.
-        house_qty = -value_flow / P
-        house_bal = self.balances.setdefault(self.house_account, {})
-        house_map: dict[str, float] = {}
-        for i, a in enumerate(self.assets):
-            if house_qty[i] != 0.0:
-                house_bal[a] = house_bal.get(a, 0.0) + float(house_qty[i])
-                house_map[a] = float(house_qty[i])
-
         self.S = S_new
         self.t += dt
 
@@ -501,9 +519,8 @@ class Exchange:
             net_value_flow={a: float(v) for a, v in zip(self.assets, value_flow)},
             gross_notional=gross,
             max_value_imbalance=float(np.max(np.abs(value_flow))) if self.n else 0.0,
-            house_flow=house_map,
+            rank=rank,
             cap_iterations=iters,
-            gauge_multiplier=mu,
         )
 
 
@@ -518,34 +535,36 @@ if __name__ == "__main__":
         prices={"RUB": 1.0, "USD": 90.0, "X1": 100.0, "X2": 100.0},
         unit_of_account="RUB",
     )
-
+ 
     ex.submit(Order(weights={"X1": +1, "RUB": -1}, z=105.0, lam=2e6, agent="buyer"))
     ex.submit(Order(weights={"X1": +1, "RUB": -1}, z=95.0,  lam=2e6, agent="seller"))
     ex.submit(Order(weights={"X1": +1, "X2": -1}, z=1.0,    lam=5e6, agent="arb"))
-
+ 
     rep = ex.step(dt=1.0)
-
+ 
     print("prices           ", {k: round(v, 4) for k, v in rep.prices.items()})
     print("expected X1      ", round(math.sqrt(105 * 95), 4),
           "  <- geometric mean of the two quotes, equal lambdas")
     print("expected X2      ", "same as X1 (single basis order => zero mispricing)")
     print("USD              ", round(rep.prices["USD"], 4),
-          "  <- unquoted, held at its previous price by the ridge")
+          "  <- unquoted, so its price is untouched")
     print("gross notional   ", f"{rep.gross_notional:,.2f}")
+    print("book rank        ", rep.rank, " of", len(ex.assets),
+          " <- price directions the book determines")
     print("max imbalance    ", f"{rep.max_value_imbalance:.3e}"
           f"  ({rep.max_value_imbalance / rep.gross_notional:.1e} of gross)")
     print()
-
+ 
     for fl in rep.fills:
         print(f"  {fl.agent:<7} f={fl.f:+.5f}  notional={fl.notional:+12.2f}  "
               + " ".join(f"{a}{q:+.3f}" for a, q in fl.quantities.items()))
     print()
-
+ 
     # Cross rates are read off directly, for any combination of legs.
     print("X1/X2 rate       ", round(ex.rate({"X1": +1, "X2": -1}), 6))
     print("X1 in USD        ", round(ex.rate({"X1": +1, "USD": -1}), 4))
     print()
-
+ 
     # A one-sided move: the buyer walks his quote up, the seller stays put.
     for step_no in range(1, 4):
         ex.submit(Order(weights={"X1": +1, "RUB": -1}, z=110.0, lam=1e6,
@@ -555,7 +574,7 @@ if __name__ == "__main__":
               f"X2={rep.prices['X2']:8.4f}  "
               f"imbalance/gross={rep.max_value_imbalance / rep.gross_notional:.1e}")
     print()
-
+ 
     for agent in ("buyer", "seller", "arb"):
         bal = {a: round(q, 3) for a, q in ex.balances[agent].items()}
         print(f"  {agent:<7} mtm={ex.mark_to_market(agent):+14.2f} RUB   {bal}")
