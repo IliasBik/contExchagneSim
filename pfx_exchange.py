@@ -509,6 +509,15 @@ class Exchange:
         self.S = S_new
         self.t += dt
 
+        # Drop dead orders from the book.  _select walks every entry in
+        # _live, so keeping cancelled/expired/spent orders around would make
+        # each step O(all orders ever submitted) in time and memory.
+        dead = [oid for oid, lo in self._live.items()
+                if not lo.active
+                or (lo.spec.expiry is not None and self.t >= lo.spec.expiry)]
+        for oid in dead:
+            del self._live[oid]
+
         return ClearingReport(
             t=self.t,
             dt=dt,

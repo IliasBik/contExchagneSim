@@ -329,7 +329,8 @@ class CoupledMarket:
 
     def __init__(self, config_a: ExchangeConfig, config_b: ExchangeConfig,
                  tick_size: float, initial_price: float,
-                 anchor_ewma_half_life: float, depth_band: float):
+                 anchor_ewma_half_life: float, depth_band: float,
+                 seed: int | None = None):
         """
         config_a, config_b    — параметры двух бирж (ExchangeConfig)
         tick_size             — шаг ценовой сетки (общий для обеих бирж)
@@ -337,8 +338,10 @@ class CoupledMarket:
         anchor_ewma_half_life — полураспад EWMA якоря, в тиках
         depth_band            — полоса ±depth_band вокруг мида, в которой
                                 считается глубина для весов якоря
+        seed                  — зерно генератора случайных чисел (None —
+                                невоспроизводимый запуск)
         """
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(seed)
         self.exchanges = {
             config_a.name: Exchange(config_a, tick_size, initial_price, rng),
             config_b.name: Exchange(config_b, tick_size, initial_price, rng),
