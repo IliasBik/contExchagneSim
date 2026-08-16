@@ -330,7 +330,7 @@ class CoupledMarket:
     def __init__(self, config_a: ExchangeConfig, config_b: ExchangeConfig,
                  tick_size: float, initial_price: float,
                  anchor_ewma_half_life: float, depth_band: float,
-                 seed: int | None = None):
+                 seed: int | None = None, fundamental_vol: float = 0.0):
         """
         config_a, config_b    — параметры двух бирж (ExchangeConfig)
         tick_size             — шаг ценовой сетки (общий для обеих бирж)
@@ -340,8 +340,14 @@ class CoupledMarket:
                                 считается глубина для весов якоря
         seed                  — зерно генератора случайных чисел (None —
                                 невоспроизводимый запуск)
+        fundamental_vol       — волатильность фундаментальной цены: std
+                                лог-шока, домножающего якорь каждый тик.
+                                Это экзогенные "новости", двигающие центр
+                                генерации фонового потока; 0 — якорь чисто
+                                эндогенный (EWMA мидов), как раньше
         """
         rng = np.random.default_rng(seed)
+        self.rng = rng
         self.exchanges = {
             config_a.name: Exchange(config_a, tick_size, initial_price, rng),
             config_b.name: Exchange(config_b, tick_size, initial_price, rng),
@@ -350,6 +356,7 @@ class CoupledMarket:
         self.depth_band = depth_band
         self.anchor = initial_price
         self._anchor_alpha = 1.0 - 0.5 ** (1.0 / anchor_ewma_half_life)
+        self.fundamental_vol = fundamental_vol
 
     def _update_anchor(self):
         """Якорь = EWMA средневзвешенного мидов; веса — глубина у мида.
@@ -371,6 +378,11 @@ class CoupledMarket:
 
         self.anchor = ((1.0 - self._anchor_alpha) * self.anchor
                        + self._anchor_alpha * weighted_mid)
+        if self.fundamental_vol > 0.0:
+            # экзогенный фундаментальный дрейф: "новости" сдвигают истинную
+            # цену, вокруг которой выставляется фоновый поток; сама рыночная
+            # цена по-прежнему образуется только аукционом заявок
+            self.anchor *= np.exp(self.rng.normal(0.0, self.fundamental_vol))
         return self.anchor
 
     def step(self):

@@ -18,10 +18,11 @@ agent_simulation.py — экосистема агентов поверх дву�
         результат заносится в балансы CE через deposit);
     5) фиксация прибыли (mark-to-market в X1) каждого агента;
     6) эволюция: после evolution_start каждый тик деактивируется агент
-       с наибольшим убытком за последние window шагов, если этот убыток
-       отрицателен и агент не последний живой в своём типе. Деактивированный
-       навсегда перестаёт торговать, его прибыль замораживается, доля
-       мощности перетекает живым.
+       с наибольшим убытком за последние window шагов — но только если
+       его суммарная прибыль за всё время тоже отрицательна и он не
+       последний живой в своём типе. Деактивированный навсегда перестаёт
+       торговать, его прибыль замораживается, доля мощности перетекает
+       живым.
 
 Запуск демо:  python agent_simulation.py
 """
@@ -76,14 +77,19 @@ class SimConfig:
     warmup: int = 200
     tick_size: float = 0.01
     initial_price: float = 100.0
-    depth_band: float = 0.5
+    # depth_band масштабируется вместе с price_std: полоса, в которой
+    # считается глубина у мида, должна накрывать типичный разброс заявок
+    depth_band: float = 4.0
     anchor_half_life: float = 20.0
+    # волатильность фундаментальной цены: лог-шок якоря за тик; уровень
+    # цен блуждает как sigma_F * sqrt(T) (1e-3 -> ~11% за 12000 тиков)
+    fundamental_vol: float = 1e-3
     venue1: ExchangeConfig = field(default_factory=lambda: ExchangeConfig(
-        name="1", arrival_rate=40.0, order_size=1.0, order_ttl=20,
-        price_std=0.5, ewma_half_life=20.0))
+        name="1", arrival_rate=10.0, order_size=1.0, order_ttl=20,
+        price_std=2.0, ewma_half_life=20.0))
     venue2: ExchangeConfig = field(default_factory=lambda: ExchangeConfig(
-        name="2", arrival_rate=8.0, order_size=1.0, order_ttl=20,
-        price_std=0.5, ewma_half_life=20.0))
+        name="2", arrival_rate=3.0, order_size=1.0, order_ttl=20,
+        price_std=2.0, ewma_half_life=20.0))
 
     progress_every: int = 2000    # период печати прогресса (0 — молча)
 
@@ -258,8 +264,11 @@ def evolution_step(cfg: SimConfig, agents: list[Agent],
                    equity: np.ndarray, t: int) -> Agent | None:
     """Деактивация худшего агента по убытку за последние window шагов.
 
-    Кандидаты перебираются от худшего к лучшему; выбывает первый, у кого
-    убыток строго отрицателен и кто не последний живой в своём типе.
+    Кандидаты перебираются от худшего окна к лучшему; выбывает первый,
+    у кого одновременно (а) убыток за окно строго отрицателен,
+    (б) суммарная прибыль за всё время тоже отрицательна — просадка
+    долгосрочно прибыльного агента не повод его убивать, и
+    (в) он не последний живой в своём типе.
     Не более одного выбытия за тик.
     """
     if t <= cfg.evolution_start:
@@ -271,8 +280,10 @@ def evolution_step(cfg: SimConfig, agents: list[Agent],
     for i in alive:
         pnl = equity[i, t] - equity[i, t - window]
         if pnl >= 0.0:
-            break                          # убыточных больше нет
+            break                          # убыточных за окно больше нет
         a = agents[i]
+        if equity[i, t] >= 0.0:
+            continue                       # суммарно прибыльный — защищён
         if kind_counts[a.kind] <= 1:
             continue                       # последний в типе — защищён
         a.active = False
@@ -308,7 +319,8 @@ def run_simulation(cfg: SimConfig, verbose: bool = True) -> SimResult:
         cfg.venue1, cfg.venue2, tick_size=cfg.tick_size,
         initial_price=cfg.initial_price,
         anchor_ewma_half_life=cfg.anchor_half_life,
-        depth_band=cfg.depth_band, seed=cfg.seed)
+        depth_band=cfg.depth_band, seed=cfg.seed,
+        fundamental_vol=cfg.fundamental_vol)
     market.warmup(cfg.warmup)
     ex1, ex2 = market.exchanges["1"], market.exchanges["2"]
 
