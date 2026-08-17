@@ -367,7 +367,7 @@ def submit_translator_orders(cfg: SimConfig, market: CoupledMarket,
     """Трансляторы читают домашний стакан и перевыставляют заявки на CE."""
     floor = cfg.capital_floor_frac * cfg.c0
     for kind in ("T1", "T2"):
-        venue, y_asset, _cash = F.TRANSLATOR_HOME[kind]
+        venue, y_asset, cash_asset = F.TRANSLATOR_HOME[kind]
         exv = market.exchanges[venue]
         members = [a for a in agents if a.kind == kind and a.active]
         if not members:
@@ -391,8 +391,12 @@ def submit_translator_orders(cfg: SimConfig, market: CoupledMarket,
             g = F.risk_coefficient(a.h_r, gamma, sigma2, cap, floor)
             q_units = ce.balances.get(a.name, {}).get(y_asset, 0.0)
             z = F.shaded_quote(mid, g, q_units * mid, cfg.shading_clamp)
+            # lam посчитана в кэше домашней площадки (H = depth*mid, а mid
+            # у T2 выражен в X2); lam_ccy поручает бирже конвертацию в
+            # единицу счёта X1 по цене прошлого шага
             ce.submit(Order(weights=F.PORTFOLIOS[kind], z=z, lam=lam,
-                            agent=a.name, expiry=ce.t + 1.0))
+                            agent=a.name, lam_ccy=cash_asset,
+                            expiry=ce.t + 1.0))
 
 
 def submit_arb_orders(cfg: SimConfig, ce: PortfolioExchange,
