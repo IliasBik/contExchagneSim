@@ -70,7 +70,17 @@ class SimConfig:
     # --- эволюционный отбор ------------------------------------------------#
     total_steps: int = 12000
     evolution_start: int = 6000
+    evolution_step: int = 100
     window: int = 2000
+
+    # --- запись прогона для отчёта ----------------------------------------- #
+    # Пишется всегда: объём данных мал (десятки МБ на 12000 тиков), а строить
+    # отчёт по неполной записи невозможно. Срезы стакана — единственное, что
+    # заметно весит, поэтому берутся с прореживанием.
+    book_snapshot_every: int = 25   # период срезов стакана, тиков (0 — не писать)
+    book_band: float = 8.0          # полуширина полосы среза вокруг мида, цена
+    book_bin: float = 0.25          # ширина ценового бина среза
+    report_dir: str = "report"      # каталог отчёта (tex, pdf, фигуры, кэш)
 
     # --- рынок -------------------------------------------------------------#
     seed: int | None = 7
@@ -85,13 +95,13 @@ class SimConfig:
     # цен блуждает как sigma_F * sqrt(T) (1e-3 -> ~11% за 12000 тиков)
     fundamental_vol: float = 1e-3
     venue1: ExchangeConfig = field(default_factory=lambda: ExchangeConfig(
-        name="1", arrival_rate=10.0, order_size=1.0, order_ttl=20,
-        price_std=2.0, ewma_half_life=20.0))
+        name="1", arrival_rate=10.0, order_size=1.0, order_ttl=5,
+        price_std=3.0, ewma_half_life=10.0))
     venue2: ExchangeConfig = field(default_factory=lambda: ExchangeConfig(
-        name="2", arrival_rate=3.0, order_size=1.0, order_ttl=20,
-        price_std=2.0, ewma_half_life=20.0))
+        name="2", arrival_rate=3.0, order_size=1.0, order_ttl=5,
+        price_std=3.0, ewma_half_life=10.0))
 
-    progress_every: int = 2000    # период печати прогресса (0 — молча)
+    progress_every: int = 500    # период печати прогресса (0 — молча)
 
 
 # --------------------------------------------------------------------------- #
@@ -114,6 +124,200 @@ class EwmaVar:
         r = np.log(level / self._prev)
         self.var = (1.0 - self._alpha) * self.var + self._alpha * r * r
         self._prev = level
+
+
+# --------------------------------------------------------------------------- #
+# Запись прогона
+# --------------------------------------------------------------------------- #
+
+KINDS = ("T1", "T2", "AX", "AY")
+VENUES = ("1", "2")
+
+
+class Recorder:
+    """Полная потиковая запись прогона — сырьё для отчёта.
+
+    Пишет три группы величин:
+
+    МИР      — справедливая цена и якорь, по каждой лимитной бирже: мид,
+               цена аукциона, лучшие котировки, спред, глубина у мида,
+               EWMA-волатильность, объём аукциона; плюс прореженные срезы
+               стакана (объём по бинам относительно мида) для тепловых карт.
+
+    CE       — оборот за тик всего и в разрезе типов агентов, число активных
+               заявок, ранг книги, невязка клиринга, среднее |f| по типам.
+
+    АГЕНТЫ   — оборот каждого агента, и разложение его PnL на две компоненты.
+               Разложение точное, а не оценочное: внутри тика цены CE меняются
+               ровно один раз (в ce.step), поэтому
+
+                   dPnL = sum_a q_prev[a] * (P_new[a] - P_old[a])   переоценка
+                        + sum_a dq_сделки[a] * P_new[a]             = 0
+                        + sum_a dq_хедж[a]   * P_new[a]             хедж
+
+               Средний член равен нулю тождественно: портфель заявки
+               самофинансируем (sum w = 0), поэтому сделка на CE не создаёт
+               и не уничтожает стоимость в момент исполнения. Весь PnL
+               транслятора — это переоценка накопленной позиции плюс то,
+               что он потерял (или выиграл) на хедже об домашний стакан.
+               Невязка этого тождества пишется в pnl_residual и служит
+               проверкой корректности (должна быть машинным нулём).
+    """
+
+    def __init__(self, cfg: SimConfig, agents: list, ce: PortfolioExchange):
+        n, T = len(agents), cfg.total_steps
+        self.cfg = cfg
+        self.n_assets = len(F.ASSETS)
+        self._idx = {a.name: i for i, a in enumerate(agents)}
+        self._kind_idx = {k: j for j, k in enumerate(KINDS)}
+        self._agent_kind = np.array([self._kind_idx[a.kind] for a in agents])
+
+        # --- агенты ---------------------------------------------------------#
+        self.turnover = np.zeros((n, T + 1), np.float32)   # |нотионал| на CE
+        self.reval = np.zeros((n, T + 1), np.float32)      # переоценка позиции
+        self.hedge_pnl = np.zeros((n, T + 1), np.float32)  # результат хеджа
+        self.pnl_residual = np.zeros(T + 1)                # контроль тождества
+
+        # --- мир ------------------------------------------------------------#
+        self.fundamental = np.zeros(T + 1)
+        self.anchor = np.zeros(T + 1)
+        self.mid = np.zeros((T + 1, 2))
+        self.last_price = np.zeros((T + 1, 2))
+        self.best_bid = np.full((T + 1, 2), np.nan)
+        self.best_ask = np.full((T + 1, 2), np.nan)
+        self.spread = np.full((T + 1, 2), np.nan)
+        self.depth = np.zeros((T + 1, 2))
+        self.vol = np.zeros((T + 1, 2))
+        self.volume = np.zeros((T + 1, 2))
+
+        # --- CE --------------------------------------------------------------#
+        self.ce_gross = np.zeros(T + 1)
+        self.ce_gross_kind = np.zeros((T + 1, len(KINDS)))
+        self.ce_absf_kind = np.zeros((T + 1, len(KINDS)))
+        self.ce_orders = np.zeros(T + 1, np.int32)
+        self.ce_rank = np.zeros(T + 1, np.int8)
+        self.ce_imbalance = np.zeros(T + 1)
+
+        # --- хедж (по площадкам) ----------------------------------------------#
+        self.hedge_count = np.zeros((T + 1, 2))
+        self.hedge_notional = np.zeros((T + 1, 2))
+        self.hedge_result = np.zeros((T + 1, 2))   # выигрыш(+)/потеря(-), X1
+
+        # --- срезы стакана ----------------------------------------------------#
+        step = cfg.book_bin
+        self.book_edges = np.arange(-cfg.book_band, cfg.book_band + step, step)
+        self.book_ticks: list[int] = []
+        self._book_bid: list[np.ndarray] = []
+        self._book_ask: list[np.ndarray] = []
+
+        # состояние для разложения PnL: количества и цены до клиринга
+        self._q_prev = np.zeros((n, self.n_assets))
+        self._p_prev = np.array([ce.price(a) for a in F.ASSETS])
+        self.stats = {"hedge_count": 0, "hedge_value": 0.0}
+
+    # ------------------------------------------------------------------ мир
+
+    def market(self, t: int, market: CoupledMarket) -> None:
+        """Состояние обеих лимитных бирж после их тика."""
+        self.fundamental[t] = market.fundamental
+        self.anchor[t] = market.anchor
+        for v, name in enumerate(VENUES):
+            ex = market.exchanges[name]
+            self.mid[t, v] = ex.mid
+            self.last_price[t, v] = ex.last_price
+            self.volume[t, v] = ex.last_trade_volume
+            self.vol[t, v] = ex.volatility
+            self.depth[t, v] = ex.depth_near_mid(self.cfg.depth_band)
+            if ex.best_bid is not None:
+                self.best_bid[t, v] = ex.best_bid
+            if ex.best_ask is not None:
+                self.best_ask[t, v] = ex.best_ask
+            if ex.spread is not None:
+                self.spread[t, v] = ex.spread
+
+        every = self.cfg.book_snapshot_every
+        if every and t % every == 0:
+            self.book_ticks.append(t)
+            for v, name in enumerate(VENUES):
+                ex = market.exchanges[name]
+                self._book_bid.append(self._bin_orders(ex.bids, ex.mid))
+                self._book_ask.append(self._bin_orders(ex.asks, ex.mid))
+
+    def _bin_orders(self, orders, mid: float) -> np.ndarray:
+        """Объём заявок по бинам смещения цены от мида."""
+        out = np.zeros(len(self.book_edges) - 1)
+        if not orders:
+            return out
+        offsets = np.fromiter((o.price - mid for o in orders), float, len(orders))
+        sizes = np.fromiter((o.size for o in orders), float, len(orders))
+        idx = np.digitize(offsets, self.book_edges) - 1
+        ok = (idx >= 0) & (idx < out.size)
+        np.add.at(out, idx[ok], sizes[ok])
+        return out
+
+    # ------------------------------------------------------------------- CE
+
+    def before_clearing(self, ce: PortfolioExchange, agents: list) -> None:
+        """Количества и цены до клиринга — база для разложения PnL."""
+        self._p_prev = np.array([ce.price(a) for a in F.ASSETS])
+        for i, a in enumerate(agents):
+            bal = ce.balances.get(a.name, {})
+            for j, asset in enumerate(F.ASSETS):
+                self._q_prev[i, j] = bal.get(asset, 0.0)
+
+    def clearing(self, t: int, report) -> None:
+        """Итоги клиринга: оборот всего, по агентам и по типам."""
+        self.ce_gross[t] = report.gross_notional
+        self.ce_orders[t] = len(report.fills)
+        self.ce_rank[t] = report.rank
+        self.ce_imbalance[t] = report.max_value_imbalance
+        counts = np.zeros(len(KINDS))
+        for fill in report.fills:
+            i = self._idx.get(fill.agent)
+            if i is None:
+                continue
+            k = self._agent_kind[i]
+            self.turnover[i, t] += abs(fill.notional)
+            self.ce_gross_kind[t, k] += abs(fill.notional)
+            self.ce_absf_kind[t, k] += abs(fill.f)
+            counts[k] += 1.0
+        np.divide(self.ce_absf_kind[t], counts, out=self.ce_absf_kind[t],
+                  where=counts > 0)
+
+    def hedge(self, t: int, venue: str, agent_idx: int, notional: float,
+              result_value: float) -> None:
+        """Один хедж: нотионал по миду и его результат в единицах счёта."""
+        v = VENUES.index(venue)
+        self.hedge_count[t, v] += 1.0
+        self.hedge_notional[t, v] += notional
+        self.hedge_result[t, v] += result_value
+        self.hedge_pnl[agent_idx, t] += result_value
+        self.stats["hedge_count"] += 1
+        self.stats["hedge_value"] += notional
+
+    def after_tick(self, t: int, ce: PortfolioExchange, agents: list,
+                   equity: np.ndarray) -> None:
+        """Переоценка позиций и проверка тождества разложения PnL."""
+        p_new = np.array([ce.price(a) for a in F.ASSETS])
+        alive = np.array([a.active for a in agents], dtype=bool)
+        self.reval[:, t] = np.where(
+            alive, self._q_prev @ (p_new - self._p_prev), 0.0)
+        delta = equity[:, t] - equity[:, t - 1]
+        parts = self.reval[:, t] + self.hedge_pnl[:, t]
+        self.pnl_residual[t] = float(np.max(np.abs(delta - parts)))
+
+    # ----------------------------------------------------------------- сборка
+
+    def finish(self) -> None:
+        """Срезы стакана — в массивы (снимки, площадка, бин)."""
+        n_snap = len(self.book_ticks)
+        shape = (n_snap, 2, len(self.book_edges) - 1)
+        self.book_bid = (np.array(self._book_bid).reshape(shape) if n_snap
+                         else np.zeros(shape))
+        self.book_ask = (np.array(self._book_ask).reshape(shape) if n_snap
+                         else np.zeros(shape))
+        self.book_ticks = np.array(self.book_ticks, dtype=int)
+        self._book_bid, self._book_ask = [], []
 
 
 # --------------------------------------------------------------------------- #
@@ -219,7 +423,7 @@ def submit_arb_orders(cfg: SimConfig, ce: PortfolioExchange,
 
 def hedge_translators(cfg: SimConfig, market: CoupledMarket,
                       ce: PortfolioExchange, agents: list[Agent],
-                      gamma: float, stats: dict) -> None:
+                      gamma: float, rec: Recorder, t: int) -> None:
     """Хедж излишка инвентаря об домашний стакан (одно обращение на агента).
 
     Решение принимается по наблюдаемым величинам (риск против полуспреда),
@@ -236,7 +440,7 @@ def hedge_translators(cfg: SimConfig, market: CoupledMarket,
         if cost is None:
             continue                      # нет встречной стороны — не хеджируем
         sigma2 = exv.volatility ** 2
-        for a in agents:
+        for i, a in enumerate(agents):
             if a.kind != kind or not a.active:
                 continue
             q_units = ce.balances.get(a.name, {}).get(y_asset, 0.0)
@@ -254,10 +458,15 @@ def hedge_translators(cfg: SimConfig, market: CoupledMarket,
             if filled <= 0.0:
                 continue
             sign = -1.0 if side == "sell" else 1.0
-            ce.deposit(a.name, y_asset, sign * filled)
-            ce.deposit(a.name, cash_asset, -sign * result["total_cost"])
-            stats["hedge_count"] += 1
-            stats["hedge_value"] += filled * mid
+            dq_y = sign * filled
+            dq_cash = -sign * result["total_cost"]
+            # стоимость, внесённая хеджем в портфель агента (в единицах счёта):
+            # актив ушёл по встречной стороне книги, а не по оценке CE, поэтому
+            # величина обычно отрицательна и равна потере на полуспреде
+            value = dq_y * ce.price(y_asset) + dq_cash * ce.price(cash_asset)
+            ce.deposit(a.name, y_asset, dq_y)
+            ce.deposit(a.name, cash_asset, dq_cash)
+            rec.hedge(t, venue, i, filled * mid, value)
 
 
 def evolution_step(cfg: SimConfig, agents: list[Agent],
@@ -269,10 +478,13 @@ def evolution_step(cfg: SimConfig, agents: list[Agent],
     (б) суммарная прибыль за всё время тоже отрицательна — просадка
     долгосрочно прибыльного агента не повод его убивать, и
     (в) он не последний живой в своём типе.
-    Не более одного выбытия за тик.
+    Не более одного выбытия за evolution_step тиков.
     """
     if t <= cfg.evolution_start:
         return None
+    if t % cfg.evolution_step != 0:
+        return None
+
     window = cfg.window
     alive = [i for i, a in enumerate(agents) if a.active]
     kind_counts = Counter(agents[i].kind for i in alive)
@@ -311,6 +523,7 @@ class SimResult:
     stats: dict
     market: CoupledMarket
     ce: PortfolioExchange
+    rec: Recorder             # полная потиковая запись (см. Recorder)
 
 
 def run_simulation(cfg: SimConfig, verbose: bool = True) -> SimResult:
@@ -354,7 +567,9 @@ def run_simulation(cfg: SimConfig, verbose: bool = True) -> SimResult:
     ce_prices[0] = [ce.price(asset) for asset in F.ASSETS]
     mids[0] = (ex1.mid, ex2.mid)
     deaths: list[tuple] = []
-    stats = {"hedge_count": 0, "hedge_value": 0.0}
+    rec = Recorder(cfg, agents, ce)
+    rec.market(0, market)
+    stats = rec.stats
 
     # волатильность базисов для шейдинга арбитражёров (оценка по ценам CE)
     basis_vol = {
@@ -368,10 +583,13 @@ def run_simulation(cfg: SimConfig, verbose: bool = True) -> SimResult:
     # --- основной цикл ------------------------------------------------------#
     for t in range(1, T + 1):
         market.step()
+        rec.market(t, market)
         submit_translator_orders(cfg, market, ce, agents, gamma)
         submit_arb_orders(cfg, ce, agents, gamma, basis_vol)
+        rec.before_clearing(ce, agents)
         report = ce.step(dt=1.0)
-        hedge_translators(cfg, market, ce, agents, gamma, stats)
+        rec.clearing(t, report)
+        hedge_translators(cfg, market, ce, agents, gamma, rec, t)
 
         for kind in ("AX", "AY"):
             basis_vol[kind].update(ce.rate(F.PORTFOLIOS[kind]))
@@ -389,6 +607,7 @@ def run_simulation(cfg: SimConfig, verbose: bool = True) -> SimResult:
         ce_prices[t] = [ce.price(asset) for asset in F.ASSETS]
         mids[t] = (ex1.mid, ex2.mid)
         gross[t] = report.gross_notional
+        rec.after_tick(t, ce, agents, equity)
 
         dead = evolution_step(cfg, agents, equity, t)
         if dead is not None:
@@ -404,10 +623,11 @@ def run_simulation(cfg: SimConfig, verbose: bool = True) -> SimResult:
                   + " ".join(f"{k}:{alive.get(k, 0):>2}"
                              for k in ("T1", "T2", "AX", "AY")))
 
+    rec.finish()
     return SimResult(config=cfg, agents=agents, equity=equity,
                      inventory=inventory, deaths=deaths, ce_prices=ce_prices,
                      mids=mids, gross=gross, gamma=gamma, stats=stats,
-                     market=market, ce=ce)
+                     market=market, ce=ce, rec=rec)
 
 
 # --------------------------------------------------------------------------- #

@@ -1,2 +1,11 @@
 __pycache__
 Промпт.txt
+
+# отчёт: всё пересобирается из кода одной командой (python make_report.py)
+report/cache/
+report/fonts/
+report/figures/
+report/*.aux
+report/*.log
+report/*.out
+report/*.toc

@@ -357,6 +357,11 @@ class CoupledMarket:
         self.anchor = initial_price
         self._anchor_alpha = 1.0 - 0.5 ** (1.0 / anchor_ewma_half_life)
         self.fundamental_vol = fundamental_vol
+        # чисто экзогенная "справедливая цена": накопленное произведение тех же
+        # лог-шоков, что двигают якорь. На динамику не влияет (ни одного
+        # лишнего обращения к rng) — это диагностический след новостей,
+        # относительно которого видно, насколько точно рынок их отслеживает.
+        self.fundamental = initial_price
 
     def _update_anchor(self):
         """Якорь = EWMA средневзвешенного мидов; веса — глубина у мида.
@@ -382,7 +387,9 @@ class CoupledMarket:
             # экзогенный фундаментальный дрейф: "новости" сдвигают истинную
             # цену, вокруг которой выставляется фоновый поток; сама рыночная
             # цена по-прежнему образуется только аукционом заявок
-            self.anchor *= np.exp(self.rng.normal(0.0, self.fundamental_vol))
+            shock = np.exp(self.rng.normal(0.0, self.fundamental_vol))
+            self.anchor *= shock
+            self.fundamental *= shock
         return self.anchor
 
     def step(self):
@@ -410,7 +417,8 @@ class CoupledMarket:
         каждой бирже: last_price, last_trade_volume, best_bid, best_ask,
         spread, mid, volatility (за тик), depth (см. depth_profile).
         """
-        state = {"tick": self.tick, "anchor": self.anchor, "exchanges": {}}
+        state = {"tick": self.tick, "anchor": self.anchor,
+                 "fundamental": self.fundamental, "exchanges": {}}
         for name, ex in self.exchanges.items():
             state["exchanges"][name] = {
                 "last_price": ex.last_price,
