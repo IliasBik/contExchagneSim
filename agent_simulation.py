@@ -48,9 +48,9 @@ class SimConfig:
     # --- население: сетки гиперпараметров -------------------------------- #
     # трансляторы: все комбинации h_m x h_R (4x4 = 16 на площадку);
     # арбитражёры: по arb_copies копий на каждое h_m (4x4 = 16 на тип)
-    h_m_values: tuple = (0.55, 0.8, 1.0, 1.35)
-    h_r_values: tuple = (0.55, 0.8, 1.0, 1.35)
-    arb_copies: int = 4
+    h_m_values: tuple = (1.0, )
+    h_r_values: tuple = (1.0, )
+    arb_copies: int = 1
 
     # --- капитал и торговая мощность ------------------------------------- #
     # kappa подобраны так, чтобы обороты CE были заметны на фоне книг, а
@@ -89,17 +89,17 @@ class SimConfig:
     initial_price: float = 100.0
     # depth_band масштабируется вместе с price_std: полоса, в которой
     # считается глубина у мида, должна накрывать типичный разброс заявок
-    depth_band: float = 4.0
+    depth_band: float = 0.5
     anchor_half_life: float = 20.0
     # волатильность фундаментальной цены: лог-шок якоря за тик; уровень
     # цен блуждает как sigma_F * sqrt(T) (1e-3 -> ~11% за 12000 тиков)
-    fundamental_vol: float = 1e-3
+    fundamental_vol: float = 1e-2
     venue1: ExchangeConfig = field(default_factory=lambda: ExchangeConfig(
         name="1", arrival_rate=10.0, order_size=1.0, order_ttl=5,
-        price_std=3.0, ewma_half_life=10.0))
+        price_std=0.5, ewma_half_life=10.0))
     venue2: ExchangeConfig = field(default_factory=lambda: ExchangeConfig(
         name="2", arrival_rate=3.0, order_size=1.0, order_ttl=5,
-        price_std=3.0, ewma_half_life=10.0))
+        price_std=0.5, ewma_half_life=10.0))
 
     progress_every: int = 500    # период печати прогресса (0 — молча)
 
