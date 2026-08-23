@@ -59,6 +59,14 @@ svg text{font-family:inherit}
 table.kv{border-collapse:collapse;width:100%}
 table.kv td{padding:1.5px 4px 1.5px 0;vertical-align:top}
 table.kv td:first-child{color:var(--muted);white-space:nowrap;width:34%}
+table.inv{border-collapse:collapse;width:100%;margin:8px 0 2px;font-size:12.5px}
+table.inv th{font-weight:normal;color:var(--muted);text-align:right;padding:2px 4px;border-bottom:1px solid var(--line);font-size:11.5px;white-space:nowrap}
+table.inv th:first-child{text-align:left}
+table.inv td{padding:4px 4px;text-align:right;vertical-align:top;border-bottom:1px solid var(--grid);font-variant-numeric:tabular-nums}
+table.inv td:first-child{text-align:left;font-weight:600;white-space:nowrap}
+table.inv td.q{font-size:14.5px;font-weight:700}
+table.inv tr.leg td{background:#f8fafc}
+table.inv tr.tot td{border-bottom:none;color:var(--muted);font-weight:normal}
 table.now td{padding:2px 8px 2px 0;white-space:nowrap}
 table.now td.num{text-align:right;font-variant-numeric:tabular-nums}
 table.now tr.h td{padding-top:7px;font-weight:600;color:var(--ink)}
@@ -125,7 +133,7 @@ kbd{font:11px monospace;border:1px solid #cfd4dc;border-radius:3px;padding:0 4px
 </section>
 
 <section>
-  <h2>Агенты <span class="muted">состояние после тика, заявка этого тика, филл клиринга, хедж; кривая спроса — нотионал V(Π) = λ·ln(z/Π) через цену безразличия z, точка — результат клиринга</span></h2>
+  <h2>Агенты <span class="muted">состояние после тика, заявка этого тика, филл клиринга, хедж. Кривая спроса — нотионал V(Π) = λ·ln(z/Π) через цену безразличия z, точка — результат клиринга; ось x — отклонение Π от mid (у арбитражёров от 1), масштаб фиксирован по всему прогону: колёсико — масштаб (Shift — только x, Alt — только y), перетаскивание — сдвиг, двойной клик или ⟲ — сброс</span></h2>
   <div class="grid g4" id="agents"></div>
 </section>
 
@@ -182,6 +190,9 @@ function fmt(x, d){
   return x.toExponential(2);
 }
 function sgn(x, d){ if (x == null || Number.isNaN(x)) return '—'; return (x > 0 ? '+' : '') + fmt(x, d); }
+// количества активов: малые числа компактно, нуль — как нуль
+function fq(x){ if (x == null || Number.isNaN(x)) return '—'; const a = Math.abs(x); if (a === 0) return '0'; if (a >= 1) return x.toFixed(4); if (a >= 1e-3) return x.toFixed(5); return x.toExponential(2); }
+function sq(x){ return (x > 0 ? '+' : '') + fq(x); }
 function cls(x){ return x > 0 ? 'pos' : x < 0 ? 'neg' : ''; }
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
 
@@ -215,12 +226,15 @@ async function parseAll(text, name){
   const ser = {
     fund:F(), anchor:F(), mid:[F(),F()], bid:[F(),F()], ask:[F(),F()], spread:[F(),F()], depth:[F(),F()], vol:[F(),F()],
     ceY1:F(), ceY2:F(), ceX2:F(), ceY2X2:F(), gross:F(),
-    eq:per(F), inv:per(F), invHome:per(F), z:per(F), zmid:per(F), fillAbs:per(Z), hedgeV:per(Z), hedgeN:per(Z),
+    eq:per(F), inv:per(F), invHome:per(F), z:per(F), zmid:per(F), fillAbs:per(Z), fillV:per(Z), hedgeV:per(Z), hedgeN:per(Z),
     hedgeCum:per(Z), active:per(()=>new Uint8Array(N)), qstar:per(F),
+    // для кривой спроса: отклонения z и цены клиринга от опоры (mid / 1), λ в X1
+    zDev:per(F), piDev:per(F), lamEff:per(F),
     cemid:[F(),F()], basisX:F(), basisY:F(),
   };
   const idx = {}; meta.agents.forEach((a,i) => idx[a.name] = i);
   const cfg = meta.config, gamma = meta.gamma, c0 = cfg.c0, floor = cfg.capital_floor_frac * c0, tick = cfg.tick_size;
+  let prevP = null;
   for (let i = 1; i < lines.length; i++){
     const r = JSON.parse(lines[i]); const t = r.t;
     ser.fund[t] = r.world.fundamental; ser.anchor[t] = r.world.anchor;
@@ -250,15 +264,20 @@ async function parseAll(text, name){
       }
     });
     r.orders.forEach(o => { const j = idx[o.agent]; if (j == null) return; ser.z[j][t] = o.z;
-      if (o.meta && o.meta.mid != null) ser.zmid[j][t] = o.z - o.meta.mid; });
-    r.fills.forEach(f => { const j = idx[f.agent]; if (j != null) ser.fillAbs[j][t] += Math.abs(f.notional); });
+      const isT = o.meta && o.meta.mid != null, ref = isT ? o.meta.mid : 1;
+      if (isT) ser.zmid[j][t] = o.z - o.meta.mid;
+      ser.zDev[j][t] = o.z - ref; ser.piDev[j][t] = rateOf(p, o.weights) - ref;
+      ser.lamEff[j][t] = o.lam * (o.lam_ccy ? (prevP || p)[o.lam_ccy] : 1); });
+    r.fills.forEach(f => { const j = idx[f.agent]; if (j != null){ ser.fillAbs[j][t] += Math.abs(f.notional); ser.fillV[j][t] += f.notional; } });
     r.hedges.forEach(h => { const j = idx[h.agent]; if (j != null){ ser.hedgeV[j][t] += h.value; ser.hedgeN[j][t] += h.notional_mid; } });
+    prevP = p;
     if (i % 500 === 0){ status(`разбор ${i}/${N}`); await new Promise(r => setTimeout(r, 0)); }
   }
   for (let j = 0; j < A; j++){ let c = 0; for (let t = 0; t < N; t++){ c += ser.hedgeV[j][t]; ser.hedgeCum[j][t] = c; } }
   const last = JSON.parse(lines[lines.length-1]);
   S.deaths = last.agents.filter(a => a.death_tick != null).map(a => ({t:a.death_tick, name:a.name, kind:a.kind}));
   S.meta = meta; S.lines = lines; S.N = N; S.ser = ser; S.idx = idx; S.cache.clear();
+  S.dscale = {}; S.dscaleDef = {}; S.lastDemand = {};
   $('#fileinfo').textContent = `${name}: ${N} тиков, ${A} агента, gamma=${fmt(meta.gamma,2)}, ${(text.length/1e6).toFixed(0)} МБ`;
 }
 
@@ -407,39 +426,96 @@ function lineChart(svg, o){
   svg.innerHTML = h;
 }
 
-/* Кривая спроса одной заявки: V(Π) = λ·ln(z/Π); точка — клиринг. */
-function demandChart(svg, d){
+/* Масштаб кривой спроса по умолчанию для агента j: по всему прогону,
+   чтобы оси не менялись от тика к тику. x — отклонение Π от опоры
+   (mid у транслятора, 1 у арбитражёра), y — нотионал V. */
+function demandDefault(j){
+  if (S.dscaleDef[j]) return S.dscaleDef[j];
+  const ser = S.ser, a = S.meta.agents[j], isT = a.kind === 'T1' || a.kind === 'T2';
+  // λ меняется на порядки (глубина книги), единого «диагонального» масштаба
+  // нет. Калибруем по медианной λ: y — 90% нотионалов клиринга, x — такой,
+  // чтобы при медианной λ линия шла из угла в угол (x = y·ref/λ_med); круче
+  // диагонали = агрессивнее обычного, положе = тоньше книга. Смещения z
+  // (95%) тоже должны помещаться.
+  const xsAll = [], zs = [], ys = [], lams = [];
+  for (let t = 0; t < S.N; t++){ const pd = ser.piDev[j][t]; if (!Number.isFinite(pd)) continue;
+    xsAll.push(Math.abs(pd)); zs.push(Math.abs(ser.zDev[j][t])); lams.push(ser.lamEff[j][t]);
+    if (ser.fillAbs[j][t] > 0) ys.push(Math.abs(ser.fillV[j][t])); }
+  const q = (arr, p) => { if (!arr.length) return 0; const s = arr.slice().sort((x, y) => x - y); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; };
+  const refv = isT ? q(Array.from(ser.mid[a.kind === 'T1' ? 0 : 1]).filter(Number.isFinite), 0.5) : 1;
+  const lamMed = q(lams, 0.5);
+  let yh = q(ys, 0.9) * 1.2;
+  let xh = yh > 0 && lamMed > 0 ? yh * refv / lamMed : q(xsAll, 0.9) * 1.2;
+  xh = Math.max(xh, q(zs, 0.95) * 1.2); if (!(xh > 0)) xh = refv * 1e-3;
+  if (!(yh > 0)) yh = lamMed * xh / refv || 1;
+  return (S.dscaleDef[j] = {xh, yh, xc:0, yc:0});
+}
+function demandScale(j){ return S.dscale[j] || {...demandDefault(j)}; }
+
+/* Кривая спроса одной заявки: V(Π) = λ·ln(z/Π) в координатах (Π − опора, V).
+   Масштаб фиксированный (sc), поэтому от тика к тику двигается кривая,
+   а не оси; точка клиринга вне поля показывается стрелкой у края. */
+function demandChart(svg, d, sc){
   const W = svg.clientWidth || 320, H = svg.clientHeight || 190;
   svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
-  const m = {l:58, r:12, t:10, b:26}, iw = W - m.l - m.r, ih = H - m.t - m.b;
-  // масштаб — по z, точке клиринга и опорной цене; «Π до клиринга» может
-  // быть далеко (скачок цены за тик) и тогда показывается стрелкой у края
-  let half = 0; [d.piA, d.ref].forEach(p => { if (Number.isFinite(p)) half = Math.max(half, Math.abs(p - d.z)); });
-  half = Math.max(half * 1.6, d.z * 2e-4);
-  const x0 = d.z - half, x1 = d.z + half, Vf = x => d.lam * Math.log(d.z / x);
-  let ymax = Math.max(Math.abs(Vf(x0)), Math.abs(Vf(x1)), Math.abs(d.V) * 1.3, 1e-12);
-  const sx = x => m.l + (x - x0) / (x1 - x0) * iw, sy = y => m.t + (ymax - y) / (2 * ymax) * ih;
-  let h = '';
-  const yst = niceStep(2 * ymax, 4);
-  ticksFor(-ymax, ymax, 4).forEach(v => { const y = sy(v).toFixed(1); h += `<line class="grid-line" x1="${m.l}" x2="${W-m.r}" y1="${y}" y2="${y}"/><text class="ax" x="${m.l-5}" y="${+y+3.5}" text-anchor="end">${fmtTick(v, yst)}</text>`; });
+  const m = {l:58, r:12, t:12, b:26}, iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const x0 = sc.xc - sc.xh, x1 = sc.xc + sc.xh, y0 = sc.yc - sc.yh, y1 = sc.yc + sc.yh;
+  const sx = x => m.l + (x - x0) / (x1 - x0) * iw, sy = y => m.t + (y1 - y) / (y1 - y0) * ih;
+  const inX = x => x >= x0 && x <= x1, inY = y => y >= y0 && y <= y1;
+  const clip = `dclip-${d.j}`;
+  let h = `<clipPath id="${clip}"><rect x="${m.l}" y="${m.t}" width="${iw}" height="${ih}"/></clipPath>`;
+  const yst = niceStep(y1 - y0, 4);
+  ticksFor(y0, y1, 4).forEach(v => { const y = sy(v).toFixed(1); h += `<line class="grid-line" x1="${m.l}" x2="${W-m.r}" y1="${y}" y2="${y}"/><text class="ax" x="${m.l-5}" y="${+y+3.5}" text-anchor="end">${fmtTick(v, yst)}</text>`; });
   const xst = niceStep(x1 - x0, 4);
   ticksFor(x0, x1, 4).forEach(v => { const x = sx(v).toFixed(1); h += `<line class="grid-line" y1="${m.t}" y2="${H-m.b}" x1="${x}" x2="${x}"/><text class="ax" x="${x}" y="${H-9}" text-anchor="middle">${fmtTick(v, xst)}</text>`; });
-  h += `<line x1="${m.l}" x2="${W-m.r}" y1="${sy(0)}" y2="${sy(0)}" stroke="#9ca3af"/>`;
-  if (Number.isFinite(d.ref)){ const x = sx(d.ref).toFixed(1); h += `<line y1="${m.t}" y2="${H-m.b}" x1="${x}" x2="${x}" stroke="#6b7280" stroke-dasharray="4 3"/><text class="lbl" x="${+x+3}" y="${H-m.b-4}" fill="#6b7280">${esc(d.refLabel)}</text>`; }
-  let p = ''; for (let i = 0; i <= 48; i++){ const x = x0 + (x1 - x0) * i / 48; p += (i ? 'L' : 'M') + sx(x).toFixed(1) + ' ' + sy(Vf(x)).toFixed(1); }
-  h += `<path d="${p}" fill="none" stroke="${d.color}" stroke-width="2"/>`;
-  h += `<circle cx="${sx(d.z)}" cy="${sy(0)}" r="4" fill="white" stroke="${d.color}" stroke-width="1.6"/><text class="lbl" x="${sx(d.z)}" y="${sy(0)-7}" text-anchor="middle" fill="${d.color}">z</text>`;
-  if (Number.isFinite(d.piB)){
-    if (d.piB >= x0 && d.piB <= x1) h += `<circle cx="${sx(d.piB)}" cy="${sy(Vf(d.piB))}" r="3.5" fill="white" stroke="#6b7280" stroke-width="1.3"><title>Π до клиринга ${fmt(d.piB)}</title></circle>`;
-    else { const right = d.piB > x1, x = right ? W - m.r - 4 : m.l + 4, y = sy(right ? -ymax * 0.85 : ymax * 0.85);
-      h += `<text class="ax" x="${x}" y="${y + 3.5}" text-anchor="${right ? 'end' : 'start'}" fill="#6b7280">${right ? 'Π до ' + fmt(d.piB, 3) + ' →' : '← Π до ' + fmt(d.piB, 3)}</text>`; }
-  }
-  if (Number.isFinite(d.piA)){ const x = sx(d.piA), y = sy(d.V); h += `<line x1="${x}" x2="${x}" y1="${sy(0)}" y2="${y}" stroke="${d.color}" stroke-dasharray="2 2"/><circle cx="${x}" cy="${y}" r="5" fill="${d.color}"/>`;
-    const left = x > m.l + iw * 0.55; h += `<text class="lbl" x="${left ? x-8 : x+8}" y="${y + (d.V >= 0 ? -6 : 12)}" text-anchor="${left ? 'end' : 'start'}" fill="#111827">V=${sgn(d.V)}</text>`; }
-  h += `<text class="ax" x="${W-m.r}" y="${m.t+9}" text-anchor="end" font-style="italic">${esc(d.xLabel)}; наклон −λ/z = ${(-d.lam / d.z).toExponential(2)}</text>`;
+  if (inY(0)) h += `<line x1="${m.l}" x2="${W-m.r}" y1="${sy(0)}" y2="${sy(0)}" stroke="#9ca3af"/>`;
+  if (inX(0)) h += `<line y1="${m.t}" y2="${H-m.b}" x1="${sx(0)}" x2="${sx(0)}" stroke="#6b7280" stroke-dasharray="4 3"/>`;
+  if (d.refLabel !== '1' && inX(0)) h += `<text class="ax" x="${sx(0)+4}" y="${m.t+9}" fill="#6b7280">${esc(d.refLabel)} ${fmt(d.ref, 3)}</text>`;
   h += `<text class="ax" x="${m.l+3}" y="${m.t+9}">V, X1/тик</text>`;
+  h += `<text class="ax" x="${W-m.r-24}" y="${m.t+9}" text-anchor="end" font-style="italic">${esc(d.xLabel)}</text>`;
+  h += `<text class="reset" x="${W-m.r}" y="${m.t+11}" text-anchor="end" font-size="14" fill="#6b7280" style="cursor:pointer"><title>сбросить масштаб (или двойной клик)</title>⟲</text>`;
+  if (!d.has){ h += `<text class="ax" x="${m.l + iw/2}" y="${m.t + ih/2}" text-anchor="middle">нет заявки</text>`; svg.innerHTML = h; return; }
+  // кривая: V(x) = λ·ln(z/(ref + x)); наклон около z равен −λ/z
+  const Vf = x => d.lam * Math.log(d.z / (d.ref + x));
+  let p = '', pen = false;
+  for (let i = 0; i <= 64; i++){ const x = x0 + (x1 - x0) * i / 64; if (d.ref + x <= 0){ pen = false; continue; } p += (pen ? 'L' : 'M') + sx(x).toFixed(1) + ' ' + sy(Vf(x)).toFixed(1); pen = true; }
+  h += `<g clip-path="url(#${clip})"><path d="${p}" fill="none" stroke="${d.color}" stroke-width="2"/>`;
+  const zx = d.z - d.ref, ax = d.piA - d.ref, bx = d.piB - d.ref;
+  if (inX(zx) && inY(0)) h += `<circle cx="${sx(zx)}" cy="${sy(0)}" r="4" fill="white" stroke="${d.color}" stroke-width="1.6"/><text class="lbl" x="${sx(zx)}" y="${sy(0)-7}" text-anchor="middle" fill="${d.color}">z</text>`;
+  if (Number.isFinite(bx) && inX(bx) && inY(Vf(bx))) h += `<circle cx="${sx(bx)}" cy="${sy(Vf(bx))}" r="3.5" fill="white" stroke="#6b7280" stroke-width="1.3"><title>Π до клиринга ${fmt(d.piB)}</title></circle>`;
+  if (Number.isFinite(ax) && inX(ax) && inY(d.V)){ const x = sx(ax), y = sy(d.V); h += `<line x1="${x}" x2="${x}" y1="${sy(Math.max(y0, Math.min(y1, 0)))}" y2="${y}" stroke="${d.color}" stroke-dasharray="2 2"/><circle cx="${x}" cy="${y}" r="5" fill="${d.color}"/>`;
+    const left = x > m.l + iw * 0.55; h += `<text class="lbl" x="${left ? x-8 : x+8}" y="${y + (d.V >= 0 ? -6 : 12)}" text-anchor="${left ? 'end' : 'start'}" fill="#111827">V=${sgn(d.V)}</text>`; }
+  h += `</g>`;
+  // точки вне поля: стрелка у края в их сторону + значения
+  const edge = (x, y, text, color) => { if (!Number.isFinite(x) || !Number.isFinite(y) || (inX(x) && inY(y))) return;
+    const px = Math.max(m.l + 6, Math.min(W - m.r - 6, sx(x))), py = Math.max(m.t + 6, Math.min(H - m.b - 6, sy(y)));
+    const dx = sx(x) - px, dy = sy(y) - py, len = Math.hypot(dx, dy) || 1, ux = dx / len, uy = dy / len;
+    h += `<path d="M${px - ux*9 - uy*5} ${py - uy*9 + ux*5} L${px} ${py} L${px - ux*9 + uy*5} ${py - uy*9 - ux*5}Z" fill="${color}"/>`;
+    const tw = text.length * 6; let tx = px + 12; if (tx + tw > W - m.r) tx = Math.max(m.l, Math.min(px - 12 - tw, W - m.r - tw));
+    h += `<text class="lbl" x="${tx}" y="${Math.max(m.t + 22, Math.min(H - m.b - 8, py + 4))}" fill="${color}" style="paint-order:stroke;stroke:#fff;stroke-width:3px">${esc(text)}</text>`; };
+  edge(ax, d.V, `клиринг: Π−${d.refLabel} ${sgn(ax, 4)}, V=${sgn(d.V)}`, d.color);
+  edge(zx, 0, `z−${d.refLabel} ${sgn(zx, 4)}`, d.color);
   svg.innerHTML = h;
 }
+
+/* Управление масштабом кривой спроса: колёсико — масштаб (Shift — только x,
+   Alt — только y), перетаскивание — сдвиг, двойной клик или ⟲ — сброс. */
+function redrawDemand(j){ const svg = document.querySelector(`#agents svg.demand[data-j="${j}"]`); if (svg && S.lastDemand[j]) demandChart(svg, S.lastDemand[j], demandScale(j)); }
+(function demandControls(){
+  const box = $('#agents'); let drag = null;
+  const target = e => { const svg = e.target.closest && e.target.closest('svg.demand'); return svg ? +svg.dataset.j : null; };
+  box.addEventListener('wheel', e => { const j = target(e); if (j == null) return; e.preventDefault();
+    const sc = {...demandScale(j)}, f = e.deltaY > 0 ? 1.25 : 0.8;
+    if (!e.altKey) sc.xh *= f; if (!e.shiftKey) sc.yh *= f; S.dscale[j] = sc; redrawDemand(j); }, {passive:false});
+  box.addEventListener('mousedown', e => { const j = target(e); if (j == null || e.button !== 0) return;
+    const svg = e.target.closest('svg.demand'), sc = demandScale(j);
+    drag = {j, x:e.clientX, y:e.clientY, xc:sc.xc, yc:sc.yc, sc, w:svg.clientWidth - 70, h:svg.clientHeight - 38, moved:false}; e.preventDefault(); });
+  document.addEventListener('mousemove', e => { if (!drag) return; const dx = e.clientX - drag.x, dy = e.clientY - drag.y; if (Math.abs(dx) + Math.abs(dy) < 2) return; drag.moved = true;
+    S.dscale[drag.j] = {...drag.sc, xc: drag.xc - dx / drag.w * 2 * drag.sc.xh, yc: drag.yc + dy / drag.h * 2 * drag.sc.yh}; redrawDemand(drag.j); });
+  document.addEventListener('mouseup', () => { drag = null; });
+  box.addEventListener('dblclick', e => { const j = target(e); if (j == null) return; delete S.dscale[j]; redrawDemand(j); });
+  box.addEventListener('click', e => { if (!e.target.classList.contains('reset')) return; const j = target(e); if (j == null) return; delete S.dscale[j]; redrawDemand(j); });
+})();
 
 /* Коридор хеджа: числовая ось стоимости позиции, полоса ±q*, до/после. */
 function corridorChart(svg, d){
@@ -597,12 +673,27 @@ function renderAgents(R, Rp){
     h += `<table class="kv">`;
     h += `<tr><td>PnL (equity)</td><td class="num"><b class="${cls(st.equity)}">${sgn(st.equity)}</b> X1 &nbsp;<span class="muted small">Δ тика ${sgn(dEq)} = переоценка ${sgn(reval)} + хедж ${sgn(hv)}</span></td></tr>`;
     h += `<tr><td>капитал</td><td class="num">${fmt(st.capital, 3)}</td></tr>`;
-    h += `<tr><td>инвентарь ${st.leg}</td><td class="num"><span class="${cls(st.inventory_units)}">${sgn(st.inventory_units)}</span> шт = ${sgn(st.inventory_value)} X1</td></tr>`;
-    h += `<tr><td>балансы</td><td class="num small">${Object.entries(st.balances).map(([k, v]) => `${k} ${sgn(v)}`).join(' · ') || '—'}</td></tr>`;
     h += `</table>`;
+    // инвентарь: по активам, с изменением за тик (клиринг + хедж)
+    const hedgeDq = {};
+    hs.forEach(x => { const y = a.kind === 'T1' ? 'Y1' : 'Y2', c = a.kind === 'T1' ? 'X1' : 'X2', s = x.side === 'sell' ? -1 : 1;
+      hedgeDq[y] = (hedgeDq[y] || 0) + s * x.filled; hedgeDq[c] = (hedgeDq[c] || 0) - s * x.total_cost; });
+    const names = Array.from(new Set([st.leg, ...Object.keys(st.balances), ...(sp ? Object.keys(sp.balances) : [])]));
+    h += `<table class="inv"><tr><th>инвентарь</th><th>количество, шт</th><th>в X1</th><th>Δ за тик, шт</th></tr>`;
+    let total = 0;
+    names.forEach(asset => {
+      const q = st.balances[asset] || 0, qp = sp ? (sp.balances[asset] || 0) : 0, dq = q - qp;
+      const df = fill ? (fill.quantities[asset] || 0) : 0, dh = hedgeDq[asset] || 0, val = q * pA[asset]; total += val;
+      let dcell = `<span class="${cls(dq)}">${sq(dq)}</span>`;
+      if (dh) dcell += `<div class="small">клиринг <span class="${cls(df)}">${sq(df)}</span></div><div class="small">хедж <span class="${cls(dh)}">${sq(dh)}</span></div>`;
+      const leg = asset === st.leg;
+      h += `<tr${leg ? ' class="leg"' : ''}><td>${asset}${leg ? ' <span class="muted small">торгуемая нога</span>' : ''}</td><td class="num q ${cls(q)}">${sq(q)}</td><td class="num ${cls(val)}">${sgn(val, 4)}</td><td class="num">${dcell}</td></tr>`; });
+    h += `<tr class="tot"><td>итого</td><td></td><td class="num ${cls(total)}">${sgn(total, 4)}</td><td>${st.active ? '= PnL' : ''}</td></tr></table>`;
     // заявка
     h += `<div class="sub">Заявка</div>`;
-    let dc = null;
+    const xLabel = isT ? `Π − mid, ${a.kind === 'T1' ? 'X1' : 'X2'}` : 'Π − 1';
+    const refNow = isT ? R.world.venues[a.kind === 'T1' ? '1' : '2'].mid : 1;
+    let dc = {j, color, has:false, ref:refNow, refLabel: isT ? 'mid' : '1', xLabel};
     if (o){
       const mt = o.meta || {}, lamEff = o.lam * (o.lam_ccy ? pB[o.lam_ccy] : 1), piA = rateOf(pA, o.weights), piB = rateOf(pB, o.weights), V = fill ? fill.notional : 0;
       const wtxt = Object.entries(o.weights).map(([k, v]) => `${v > 0 ? '+' : '−'}${k}`).join(' ');
@@ -623,8 +714,7 @@ function renderAgents(R, Rp){
       if (fill){
         h += `<div class="num">f = ${sgn(fill.f)} → V = <b class="${cls(V)}">${sgn(V)}</b> X1: ${Object.entries(fill.quantities).map(([k, v]) => `<span class="${cls(v)}">${k} ${sgn(v)}</span>`).join(', ')}</div>`;
       } else h += `<div class="muted">филла нет (V = 0)</div>`;
-      const xLabel = isT ? (a.kind === 'T1' ? 'Π = P(Y1)/P(X1), X1' : 'Π = P(Y2)/P(X2), X2') : (a.kind === 'AX' ? 'Π = P(X1)/P(X2)' : 'Π = P(Y1)/P(Y2)');
-      dc = {z:o.z, lam:lamEff, piA, piB, V, ref: isT ? mt.mid : 1, refLabel: isT ? 'mid' : '1', color, xLabel};
+      Object.assign(dc, {has:true, z:o.z, lam:lamEff, piA, piB, V, ref: isT ? mt.mid : 1});
     } else {
       h += `<div class="muted">${st.active ? 'заявки нет (λ ≤ 0 или пустая книга)' : 'не торгует'}</div>`;
     }
@@ -633,11 +723,11 @@ function renderAgents(R, Rp){
       if (hs.length){ hs.forEach(x => { h += `<div class="num">${x.side === 'sell' ? 'продал' : 'купил'} ${fmt(x.filled, 5)} шт @ ${fmt(x.avg_price, 3)} <span class="muted small">(запрошено ${fmt(x.requested, 5)}, стоимость ${fmt(x.total_cost, 4)}, ≈${fmt(x.notional_mid, 4)} по mid)</span>; вклад в PnL <b class="${cls(x.value)}">${sgn(x.value)}</b></div>`; }); }
       else h += `<div class="muted">нет</div>`;
     }
-    h += `<svg class="demand"></svg></div>`;
-    cards.push(h); charts.push(dc);
+    h += `<svg class="demand" data-j="${j}"></svg></div>`;
+    cards.push(h); charts.push(dc); S.lastDemand[j] = dc;
   });
   $('#agents').innerHTML = cards.join('');
-  document.querySelectorAll('#agents svg.demand').forEach((svg, j) => { const d = charts[j]; if (d) demandChart(svg, d); else { svg.innerHTML = `<text class="ax" x="10" y="20">нет заявки — нет кривой</text>`; } });
+  document.querySelectorAll('#agents svg.demand').forEach(svg => { const j = +svg.dataset.j; demandChart(svg, charts[j], demandScale(j)); });
 }
 
 function renderHedge(R, Rp, x0, x1){
