@@ -1,0 +1,796 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Прогон по тикам</title>
+<!--
+  detail_view.html — потиковый просмотр журнала detail_log.jsonl.
+
+  Страница самодостаточна (чистый JS + SVG, без библиотек). Журнал читается
+  целиком как текст; при загрузке один раз собираются серии для графиков
+  во времени, а при переходе на тик разбираются только две строки JSON
+  (текущий и предыдущий тик), поэтому навигация мгновенная.
+
+  Запуск: python view_log.py   (или открыть файл и выбрать журнал кнопкой)
+-->
+<style>
+:root{
+  --bg:#f4f5f7; --card:#fff; --ink:#1f2430; --muted:#6b7280; --line:#e2e5ea; --grid:#eef0f3;
+  --fund:#111827; --anchor:#9ca3af; --v1:#2563eb; --v2:#ea580c; --ce1:#60a5fa; --ce2:#fb923c;
+  --T1:#2563eb; --T2:#ea580c; --AX:#16a34a; --AY:#9333ea; --bid:#16a34a; --ask:#dc2626;
+}
+*{box-sizing:border-box}
+body{margin:0;font:13px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:var(--bg)}
+header{position:sticky;top:0;z-index:20;background:#fff;border-bottom:1px solid var(--line);padding:8px 16px 6px}
+.hrow{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center}
+.hrow+.hrow{margin-top:6px}
+h1{font-size:15px;margin:0 8px 0 0}
+button{font:inherit;padding:3px 9px;border:1px solid #cfd4dc;background:#fafbfc;border-radius:5px;cursor:pointer}
+button:hover{background:#eef1f5}
+button.play{min-width:34px}
+input[type=number]{width:84px;font:inherit;padding:3px 6px;border:1px solid #cfd4dc;border-radius:5px}
+select{font:inherit;padding:2px 4px}
+#slider{width:100%;margin:6px 0 0}
+.muted{color:var(--muted)}
+.small{font-size:11.5px}
+main{padding:12px 16px 40px;max-width:1900px;margin:0 auto}
+section{margin-bottom:16px}
+section>h2{font-size:14px;margin:0 0 8px;display:flex;align-items:baseline;gap:12px}
+section>h2 .muted{font-weight:normal;font-size:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+.grid{display:grid;gap:12px}
+.g4{grid-template-columns:repeat(4,minmax(0,1fr))}
+.g3{grid-template-columns:repeat(3,minmax(0,1fr))}
+.g2{grid-template-columns:repeat(2,minmax(0,1fr))}
+.gprices{grid-template-columns:minmax(0,1fr) 440px}
+@media(max-width:1400px){.g4{grid-template-columns:repeat(2,minmax(0,1fr))}.g3{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:1100px){.gprices{grid-template-columns:1fr}}
+@media(max-width:800px){.g4,.g3,.g2{grid-template-columns:1fr}}
+svg.chart{width:100%;height:230px;display:block}
+svg.chart.tall{height:300px}
+svg.demand{width:100%;height:190px;display:block;margin-top:6px}
+svg.corridor{width:100%;height:74px;display:block}
+svg.book{width:100%;height:420px;display:block}
+svg text{font-family:inherit}
+.grid-line{stroke:var(--grid)}
+.ax{font-size:10.5px;fill:var(--muted)}
+.lbl{font-size:10.5px}
+.ttl{font-size:12px;font-weight:600}
+table.kv{border-collapse:collapse;width:100%}
+table.kv td{padding:1.5px 4px 1.5px 0;vertical-align:top}
+table.kv td:first-child{color:var(--muted);white-space:nowrap;width:34%}
+table.inv{border-collapse:collapse;width:100%;margin:8px 0 2px;font-size:12.5px}
+table.inv th{font-weight:normal;color:var(--muted);text-align:right;padding:2px 4px;border-bottom:1px solid var(--line);font-size:11.5px;white-space:nowrap}
+table.inv th:first-child{text-align:left}
+table.inv td{padding:4px 4px;text-align:right;vertical-align:top;border-bottom:1px solid var(--grid);font-variant-numeric:tabular-nums}
+table.inv td:first-child{text-align:left;font-weight:600;white-space:nowrap}
+table.inv td.q{font-size:14.5px;font-weight:700}
+table.inv tr.leg td{background:#f8fafc}
+table.inv tr.tot td{border-bottom:none;color:var(--muted);font-weight:normal}
+table.now td{padding:2px 8px 2px 0;white-space:nowrap}
+table.now td.num{text-align:right;font-variant-numeric:tabular-nums}
+table.now tr.h td{padding-top:7px;font-weight:600;color:var(--ink)}
+.num{font-variant-numeric:tabular-nums}
+.tag{display:inline-block;padding:0 6px;border-radius:10px;font-size:11px;background:#eef1f5;color:#374151;margin-left:4px}
+.tag.dead{background:#fee2e2;color:#991b1b}
+.tag.alive{background:#dcfce7;color:#166534}
+.sub{font-weight:600;margin:8px 0 2px;font-size:12px;border-top:1px dashed var(--line);padding-top:6px}
+.pos{color:#15803d}.neg{color:#b91c1c}
+.card.agent{border-top:3px solid var(--line)}
+.legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:11.5px;color:var(--muted);margin:4px 0 0}
+.legend i{display:inline-block;width:14px;height:0;border-top:2px solid;vertical-align:middle;margin-right:4px}
+.legend i.dash{border-top-style:dashed}
+#status{color:var(--muted)}
+.hint{font-size:12px;color:var(--muted)}
+kbd{font:11px monospace;border:1px solid #cfd4dc;border-radius:3px;padding:0 4px;background:#fafbfc}
+.note{font-size:12px;color:var(--muted);margin-top:6px}
+</style>
+</head>
+<body>
+<header>
+  <div class="hrow">
+    <h1>Прогон по тикам</h1>
+    <span id="loader">
+      <input type="file" id="file" accept=".jsonl,.json,.txt">
+      <span id="status"></span>
+    </span>
+    <span id="fileinfo" class="muted small"></span>
+  </div>
+  <div class="hrow" id="nav" hidden>
+    <span>
+      <button data-d="-1000">−1000</button><button data-d="-100">−100</button><button data-d="-10">−10</button><button data-d="-1">−1</button>
+    </span>
+    <label>тик <input id="tick" type="number" min="0" step="1" value="0"> <span id="tmax" class="muted"></span></label>
+    <span>
+      <button data-d="1">+1</button><button data-d="10">+10</button><button data-d="100">+100</button><button data-d="1000">+1000</button>
+    </span>
+    <span><button id="play" class="play" title="Space">▶</button>
+      <select id="speed" title="скорость воспроизведения"><option value="2">2 тика/с</option><option value="5" selected>5 тиков/с</option><option value="20">20 тиков/с</option><option value="60">60 тиков/с</option></select></span>
+    <label>окно графиков <select id="win"><option value="100">100</option><option value="300" selected>300</option><option value="1000">1000</option><option value="3000">3000</option><option value="all">весь прогон</option></select></label>
+    <span class="hint"><kbd>←</kbd><kbd>→</kbd> ±1 · <kbd>Shift</kbd> ±10 · <kbd>Ctrl</kbd> ±100 · <kbd>Home</kbd>/<kbd>End</kbd> · <kbd>Space</kbd> play · <kbd>H</kbd> следующий хедж · <kbd>D</kbd> следующая смерть</span>
+  </div>
+  <input id="slider" type="range" min="0" max="0" value="0" hidden>
+</header>
+
+<main id="main" hidden>
+
+<section>
+  <h2>Цены <span class="muted">настоящая (фундаментальная), миды обеих лимитных бирж и цены CE; вертикаль — текущий тик</span></h2>
+  <div class="grid gprices">
+    <div class="card">
+      <svg id="ch-prices" class="chart tall"></svg>
+      <div class="legend">
+        <span><i style="border-color:var(--fund)"></i>фундаментальная</span>
+        <span><i class="dash" style="border-color:var(--anchor)"></i>якорь</span>
+        <span><i style="border-color:var(--v1)"></i>mid биржи 1</span>
+        <span><i style="border-color:var(--v2)"></i>mid биржи 2</span>
+        <span><i class="dash" style="border-color:var(--ce1)"></i>CE: Y1 (в X1)</span>
+        <span><i class="dash" style="border-color:var(--ce2)"></i>CE: Y2/X2 (в X2)</span>
+      </div>
+    </div>
+    <div class="card" id="now"></div>
+  </div>
+</section>
+
+<section>
+  <h2>Агенты <span class="muted">состояние после тика, заявка этого тика, филл клиринга, хедж. Кривая спроса — нотионал V(Π) = λ·ln(z/Π) через цену безразличия z, точка — результат клиринга; ось x — отклонение Π от mid (у арбитражёров от 1), масштаб фиксирован по всему прогону: колёсико — масштаб (Shift — только x, Alt — только y), перетаскивание — сдвиг, двойной клик или ⟲ — сброс</span></h2>
+  <div class="grid g4" id="agents"></div>
+</section>
+
+<section>
+  <h2>Хедж трансляторов <span class="muted">коридор |q|·mid ≤ q* = cost/g: внутри — держим, снаружи — сбрасываем излишек об домашний стакан</span></h2>
+  <div class="grid g2" id="hedge"></div>
+  <div class="grid g3" style="margin-top:12px">
+    <div class="card"><svg id="ch-inv-T1" class="chart"></svg></div>
+    <div class="card"><svg id="ch-inv-T2" class="chart"></svg></div>
+    <div class="card"><svg id="ch-hedgecum" class="chart"></svg></div>
+  </div>
+</section>
+
+<section>
+  <h2>Динамика <span class="muted">в окне вокруг текущего тика</span></h2>
+  <div class="grid g2">
+    <div class="card"><svg id="ch-equity" class="chart"></svg></div>
+    <div class="card"><svg id="ch-inv" class="chart"></svg></div>
+    <div class="card"><svg id="ch-turnover" class="chart"></svg></div>
+    <div class="card"><svg id="ch-cevsmid" class="chart"></svg></div>
+    <div class="card"><svg id="ch-basis" class="chart"></svg></div>
+    <div class="card"><svg id="ch-z" class="chart"></svg></div>
+  </div>
+</section>
+
+<section>
+  <h2>Стаканы лимитных бирж <span class="muted">лучшие уровни на момент тика (после аукциона); слева объём bid, справа ask; горизонтали — mid, фундаментальная, цена CE, z транслятора, средняя цена хеджа; тёмная часть столбика — объём, съеденный хеджем</span></h2>
+  <div class="grid g2">
+    <div class="card"><svg id="book1" class="book"></svg></div>
+    <div class="card"><svg id="book2" class="book"></svg></div>
+  </div>
+</section>
+
+</main>
+
+<script>
+'use strict';
+const $ = s => document.querySelector(s);
+const COL = {T1:'#2563eb', T2:'#ea580c', AX:'#16a34a', AY:'#9333ea',
+             fund:'#111827', anchor:'#9ca3af', v1:'#2563eb', v2:'#ea580c', ce1:'#60a5fa', ce2:'#fb923c',
+             bid:'#16a34a', ask:'#dc2626'};
+const S = {meta:null, lines:null, N:0, t:0, win:300, ser:null, idx:null, cache:new Map(), timer:null, deaths:[]};
+
+// ------------------------------------------------------------ форматирование
+function fmt(x, d){
+  if (x == null || Number.isNaN(x)) return '—';
+  if (!Number.isFinite(x)) return String(x);
+  const a = Math.abs(x);
+  if (a === 0) return '0';
+  if (d != null) return x.toFixed(d);
+  if (a >= 1000) return x.toFixed(2);
+  if (a >= 1) return x.toFixed(4);
+  if (a >= 1e-3) return x.toFixed(6);
+  return x.toExponential(2);
+}
+function sgn(x, d){ if (x == null || Number.isNaN(x)) return '—'; return (x > 0 ? '+' : '') + fmt(x, d); }
+// количества активов: малые числа компактно, нуль — как нуль
+function fq(x){ if (x == null || Number.isNaN(x)) return '—'; const a = Math.abs(x); if (a === 0) return '0'; if (a >= 1) return x.toFixed(4); if (a >= 1e-3) return x.toFixed(5); return x.toExponential(2); }
+function sq(x){ return (x > 0 ? '+' : '') + fq(x); }
+function cls(x){ return x > 0 ? 'pos' : x < 0 ? 'neg' : ''; }
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+
+// ------------------------------------------------------------------ загрузка
+function status(s){ $('#status').textContent = s; }
+
+async function fetchLog(url){
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status} для ${url}`);
+  const total = +res.headers.get('content-length') || 0;
+  const reader = res.body.getReader(); const dec = new TextDecoder();
+  let got = 0, text = '';
+  for(;;){
+    const {done, value} = await reader.read();
+    if (done) break;
+    got += value.length; text += dec.decode(value, {stream:true});
+    status(`загрузка ${(got/1e6).toFixed(1)}${total ? '/' + (total/1e6).toFixed(1) : ''} МБ`);
+  }
+  text += dec.decode();
+  return text;
+}
+
+async function parseAll(text, name){
+  const lines = text.split('\n');
+  while (lines.length && !lines[lines.length-1].trim()) lines.pop();
+  const meta = JSON.parse(lines[0]);
+  if (meta.type !== 'meta') throw new Error('первая строка файла — не meta');
+  const N = lines.length - 1, A = meta.agents.length;
+  const F = () => new Float64Array(N).fill(NaN), Z = () => new Float64Array(N);
+  const per = mk => meta.agents.map(mk);
+  const ser = {
+    fund:F(), anchor:F(), mid:[F(),F()], bid:[F(),F()], ask:[F(),F()], spread:[F(),F()], depth:[F(),F()], vol:[F(),F()],
+    ceY1:F(), ceY2:F(), ceX2:F(), ceY2X2:F(), gross:F(),
+    eq:per(F), inv:per(F), invHome:per(F), z:per(F), zmid:per(F), fillAbs:per(Z), fillV:per(Z), hedgeV:per(Z), hedgeN:per(Z),
+    hedgeCum:per(Z), active:per(()=>new Uint8Array(N)), qstar:per(F),
+    // для кривой спроса: отклонения z и цены клиринга от опоры (mid / 1), λ в X1
+    zDev:per(F), piDev:per(F), lamEff:per(F),
+    cemid:[F(),F()], basisX:F(), basisY:F(),
+  };
+  const idx = {}; meta.agents.forEach((a,i) => idx[a.name] = i);
+  const cfg = meta.config, gamma = meta.gamma, c0 = cfg.c0, floor = cfg.capital_floor_frac * c0, tick = cfg.tick_size;
+  let prevP = null;
+  for (let i = 1; i < lines.length; i++){
+    const r = JSON.parse(lines[i]); const t = r.t;
+    ser.fund[t] = r.world.fundamental; ser.anchor[t] = r.world.anchor;
+    ['1','2'].forEach((v,k) => {
+      const e = r.world.venues[v];
+      ser.mid[k][t] = e.mid; ser.bid[k][t] = e.best_bid ?? NaN; ser.ask[k][t] = e.best_ask ?? NaN;
+      ser.spread[k][t] = e.spread ?? NaN; ser.depth[k][t] = e.depth; ser.vol[k][t] = e.volatility;
+    });
+    const p = r.ce.prices;
+    ser.ceY1[t] = p.Y1; ser.ceY2[t] = p.Y2; ser.ceX2[t] = p.X2; ser.ceY2X2[t] = p.Y2 / p.X2;
+    ser.gross[t] = r.ce.gross_notional ?? NaN;
+    ser.cemid[0][t] = p.Y1 - r.world.venues['1'].mid;
+    ser.cemid[1][t] = p.Y2 / p.X2 - r.world.venues['2'].mid;
+    ser.basisX[t] = p.X1 / p.X2 - 1;      // индекс AX = P_X1/P_X2
+    ser.basisY[t] = p.Y1 / p.Y2 - 1;      // индекс AY = P_Y1/P_Y2
+    r.agents.forEach((a,j) => {
+      ser.eq[j][t] = a.equity; ser.inv[j][t] = a.inventory_value; ser.active[j][t] = a.active ? 1 : 0;
+      const kind = meta.agents[j].kind;
+      if (kind === 'T1' || kind === 'T2'){
+        const e = r.world.venues[kind === 'T1' ? '1' : '2'];
+        ser.invHome[j][t] = a.inventory_units * e.mid;
+        if (e.spread != null){
+          const cost = 0.5 * Math.max(e.spread, tick) / e.mid;
+          const g = meta.agents[j].h_r * gamma * e.volatility * e.volatility / Math.max(c0 + a.equity, floor);
+          ser.qstar[j][t] = g > 0 ? cost / g : NaN;
+        }
+      }
+    });
+    r.orders.forEach(o => { const j = idx[o.agent]; if (j == null) return; ser.z[j][t] = o.z;
+      const isT = o.meta && o.meta.mid != null, ref = isT ? o.meta.mid : 1;
+      if (isT) ser.zmid[j][t] = o.z - o.meta.mid;
+      ser.zDev[j][t] = o.z - ref; ser.piDev[j][t] = rateOf(p, o.weights) - ref;
+      ser.lamEff[j][t] = o.lam * (o.lam_ccy ? (prevP || p)[o.lam_ccy] : 1); });
+    r.fills.forEach(f => { const j = idx[f.agent]; if (j != null){ ser.fillAbs[j][t] += Math.abs(f.notional); ser.fillV[j][t] += f.notional; } });
+    r.hedges.forEach(h => { const j = idx[h.agent]; if (j != null){ ser.hedgeV[j][t] += h.value; ser.hedgeN[j][t] += h.notional_mid; } });
+    prevP = p;
+    if (i % 500 === 0){ status(`разбор ${i}/${N}`); await new Promise(r => setTimeout(r, 0)); }
+  }
+  for (let j = 0; j < A; j++){ let c = 0; for (let t = 0; t < N; t++){ c += ser.hedgeV[j][t]; ser.hedgeCum[j][t] = c; } }
+  const last = JSON.parse(lines[lines.length-1]);
+  S.deaths = last.agents.filter(a => a.death_tick != null).map(a => ({t:a.death_tick, name:a.name, kind:a.kind}));
+  S.meta = meta; S.lines = lines; S.N = N; S.ser = ser; S.idx = idx; S.cache.clear();
+  S.dscale = {}; S.dscaleDef = {}; S.lastDemand = {};
+  $('#fileinfo').textContent = `${name}: ${N} тиков, ${A} агента, gamma=${fmt(meta.gamma,2)}, ${(text.length/1e6).toFixed(0)} МБ`;
+}
+
+function getTick(t){
+  if (t < 0 || t >= S.N) return null;
+  let r = S.cache.get(t);
+  if (!r){ r = JSON.parse(S.lines[t+1]); S.cache.set(t, r); if (S.cache.size > 120) S.cache.delete(S.cache.keys().next().value); }
+  return r;
+}
+
+async function openText(text, name){
+  try {
+    status('разбор…'); await parseAll(text, name);
+    $('#loader').hidden = true; $('#nav').hidden = false; $('#slider').hidden = false; $('#main').hidden = false;
+    $('#slider').max = S.N - 1; $('#tick').max = S.N - 1; $('#tmax').textContent = `из ${S.N-1}`;
+    setTick(Math.min(S.t, S.N - 1));
+  } catch (e){ status('ошибка: ' + e.message); console.error(e); }
+}
+
+$('#file').addEventListener('change', async ev => {
+  const f = ev.target.files[0]; if (!f) return;
+  status('чтение файла…'); openText(await f.text(), f.name);
+});
+
+(async function autoload(){
+  if (!location.protocol.startsWith('http')) { status('выберите файл журнала (detail_log.jsonl)'); return; }
+  const qs = new URLSearchParams(location.search), file = qs.get('file') || 'detail_log.jsonl';
+  if (qs.get('t') != null) S.t = +qs.get('t') || 0;
+  try { const text = await fetchLog(file); await openText(text, file); }
+  catch (e){ status(`не удалось загрузить ${file}: ${e.message} — выберите файл вручную`); }
+})();
+
+// ---------------------------------------------------------------- навигация
+function setTick(t){
+  t = Math.max(0, Math.min(S.N - 1, Math.round(t)));
+  S.t = t; $('#tick').value = t; $('#slider').value = t;
+  render();
+  // адрес страницы всегда указывает на текущий тик — ссылку можно сохранить
+  if (location.protocol.startsWith('http')){ const u = new URL(location.href); u.searchParams.set('t', t); history.replaceState(null, '', u); }
+}
+document.querySelectorAll('#nav button[data-d]').forEach(b => b.addEventListener('click', () => setTick(S.t + (+b.dataset.d))));
+$('#tick').addEventListener('change', e => setTick(+e.target.value));
+$('#slider').addEventListener('input', e => setTick(+e.target.value));
+$('#win').addEventListener('change', e => { S.win = e.target.value === 'all' ? 'all' : +e.target.value; render(); });
+function togglePlay(){
+  if (S.timer){ clearInterval(S.timer); S.timer = null; $('#play').textContent = '▶'; return; }
+  const fps = +$('#speed').value;
+  $('#play').textContent = '❚❚';
+  S.timer = setInterval(() => { if (S.t >= S.N - 1) togglePlay(); else setTick(S.t + 1); }, 1000 / fps);
+}
+$('#play').addEventListener('click', togglePlay);
+$('#speed').addEventListener('change', () => { if (S.timer){ togglePlay(); togglePlay(); } });
+function nextEvent(pred){ for (let t = S.t + 1; t < S.N; t++) if (pred(t)) { setTick(t); return; } }
+document.addEventListener('keydown', e => {
+  if (!S.ser || e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  const step = e.ctrlKey ? 100 : e.shiftKey ? 10 : 1;
+  if (e.key === 'ArrowRight'){ setTick(S.t + step); e.preventDefault(); }
+  else if (e.key === 'ArrowLeft'){ setTick(S.t - step); e.preventDefault(); }
+  else if (e.key === 'Home'){ setTick(0); }
+  else if (e.key === 'End'){ setTick(S.N - 1); }
+  else if (e.key === ' '){ togglePlay(); e.preventDefault(); }
+  else if (e.key === 'h' || e.key === 'H' || e.key === 'р' || e.key === 'Р'){ nextEvent(t => S.ser.hedgeN.some(h => h[t] > 0)); }
+  else if (e.key === 'd' || e.key === 'D' || e.key === 'в' || e.key === 'В'){ nextEvent(t => S.deaths.some(d => d.t === t)); }
+});
+
+function windowRange(){
+  const N = S.N;
+  if (S.win === 'all') return [0, N - 1];
+  const w = Math.min(S.win, N - 1);
+  let x0 = Math.round(S.t - w * 0.6); x0 = Math.max(0, Math.min(x0, N - 1 - w));
+  return [x0, x0 + w];
+}
+
+// ----------------------------------------------------------- графики (SVG)
+function niceStep(range, n){
+  const raw = range / Math.max(n, 1); if (!(raw > 0)) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(raw))); const m = raw / p;
+  return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * p;
+}
+function ticksFor(lo, hi, n){ const st = niceStep(hi - lo, n); const out = []; for (let v = Math.ceil(lo/st - 1e-9)*st; v <= hi + st*1e-6; v += st) out.push(v); return out; }
+function fmtTick(v, st){ const d = Math.max(0, -Math.floor(Math.log10(st))); return Math.abs(v) < st*1e-6 ? '0' : (d > 7 ? v.toExponential(1) : v.toFixed(Math.min(d, 8))); }
+
+/* Универсальный линейный график во времени.
+   o: {x0,x1,title, series:[{ys,color,dash,width,label}], bands:[{lo,hi,color,label}],
+       stacks:[{ys,color,label}], hlines:[{y,color,dash,label}], vlines:[{x,color,label}],
+       markers:[{x,y,color,shape,r,label}], zero:bool, cursor:t} */
+function lineChart(svg, o){
+  const W = svg.clientWidth || 600, H = svg.clientHeight || 230;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  const m = {l:64, r:12, t:o.title ? 26 : 10, b:22}, iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const x0 = o.x0, x1 = Math.max(o.x1, o.x0 + 1);
+  const ta = Math.max(0, Math.floor(x0)), tb = Math.min(S.N - 1, Math.ceil(x1));
+  let lo = Infinity, hi = -Infinity;
+  const scan = a => { for (let t = ta; t <= tb; t++){ const v = a[t]; if (Number.isFinite(v)){ if (v < lo) lo = v; if (v > hi) hi = v; } } };
+  (o.series||[]).forEach(s => scan(s.ys));
+  // полоса (band) не должна задавать масштаб: коридор хеджа временами в сотни
+  // раз шире позиции; учитываем её только в пределах ~2.5x размаха серий
+  (o.bands||[]).forEach(b => { if (!b.soft){ scan(b.lo); scan(b.hi); return; }
+    const span = Number.isFinite(lo) ? Math.max(Math.abs(lo), Math.abs(hi)) * 2.5 : Infinity;
+    for (let t = ta; t <= tb; t++){ [b.lo[t], b.hi[t]].forEach(v => { if (Number.isFinite(v) && Math.abs(v) <= span){ if (v < lo) lo = v; if (v > hi) hi = v; } }); } });
+  if (o.stacks && o.stacks.length){ for (let t = ta; t <= tb; t++){ let s = 0; o.stacks.forEach(st => s += st.ys[t] || 0); if (s > hi) hi = s; if (s < lo) lo = s; } }
+  (o.hlines||[]).forEach(h => { if (Number.isFinite(h.y)){ lo = Math.min(lo, h.y); hi = Math.max(hi, h.y); } });
+  (o.markers||[]).forEach(k => { if (Number.isFinite(k.y)){ lo = Math.min(lo, k.y); hi = Math.max(hi, k.y); } });
+  if (!Number.isFinite(lo)){ lo = 0; hi = 1; }
+  if (o.zero){ lo = Math.min(lo, 0); hi = Math.max(hi, 0); }
+  if (hi - lo < 1e-15){ const c = lo; lo = c - (Math.abs(c) || 1) * 1e-3; hi = c + (Math.abs(c) || 1) * 1e-3; }
+  const pad = (hi - lo) * 0.07; lo -= pad; hi += pad;
+  const sx = t => m.l + (t - x0) / (x1 - x0) * iw, sy = v => m.t + (hi - v) / (hi - lo) * ih;
+  let h = '';
+  const yst = niceStep(hi - lo, 5);
+  ticksFor(lo, hi, 5).forEach(v => { const y = sy(v).toFixed(1); h += `<line class="grid-line" x1="${m.l}" x2="${W-m.r}" y1="${y}" y2="${y}"/><text class="ax" x="${m.l-6}" y="${+y+3.5}" text-anchor="end">${fmtTick(v, yst)}</text>`; });
+  const xst = niceStep(x1 - x0, 6);
+  ticksFor(x0, x1, 6).forEach(v => { const x = sx(v).toFixed(1); h += `<line class="grid-line" y1="${m.t}" y2="${H-m.b}" x1="${x}" x2="${x}"/><text class="ax" x="${x}" y="${H-7}" text-anchor="middle">${fmtTick(v, xst)}</text>`; });
+  if (lo < 0 && hi > 0) h += `<line x1="${m.l}" x2="${W-m.r}" y1="${sy(0)}" y2="${sy(0)}" stroke="#9ca3af" stroke-width="1"/>`;
+  const clipId = (svg.id || 'c') + '-clip';
+  h += `<clipPath id="${clipId}"><rect x="${m.l}" y="${m.t}" width="${iw}" height="${ih}"/></clipPath><g clip-path="url(#${clipId})">`;
+  (o.bands||[]).forEach(b => {
+    let up = '', down = '', on = false;
+    const flush = () => { if (on) h += `<path d="${up}${down}Z" fill="${b.color}" opacity="0.13"/>`; up = ''; down = ''; on = false; };
+    for (let t = ta; t <= tb; t++){ const a = b.lo[t], c = b.hi[t]; if (!Number.isFinite(a) || !Number.isFinite(c)){ flush(); continue; }
+      up += (on ? 'L' : 'M') + sx(t).toFixed(1) + ' ' + sy(c).toFixed(1); down = 'L' + sx(t).toFixed(1) + ' ' + sy(a).toFixed(1) + down; on = true; }
+    flush();
+  });
+  if (o.stacks && o.stacks.length){
+    const bw = Math.max(1, iw / (x1 - x0) * 0.85), base = new Float64Array(tb - ta + 1);
+    o.stacks.forEach(st => { for (let t = ta; t <= tb; t++){ const v = st.ys[t] || 0; if (!v) continue; const y1 = sy(base[t-ta]), y2 = sy(base[t-ta] + v);
+      h += `<rect x="${(sx(t)-bw/2).toFixed(1)}" y="${Math.min(y1,y2).toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(0.6, Math.abs(y1-y2)).toFixed(1)}" fill="${st.color}" opacity="0.8"/>`; base[t-ta] += v; } });
+  }
+  (o.series||[]).forEach(s => {
+    let d = '', pen = false;
+    for (let t = ta; t <= tb; t++){ const v = s.ys[t]; if (!Number.isFinite(v)){ pen = false; continue; } d += (pen ? 'L' : 'M') + sx(t).toFixed(1) + ' ' + sy(v).toFixed(1); pen = true; }
+    h += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="${s.width || 1.4}"${s.dash ? ` stroke-dasharray="${s.dash}"` : ''} opacity="${s.opacity || 1}"/>`;
+  });
+  h += `</g>`;
+  (o.hlines||[]).forEach(l => { if (!Number.isFinite(l.y)) return; const y = sy(l.y).toFixed(1); h += `<line x1="${m.l}" x2="${W-m.r}" y1="${y}" y2="${y}" stroke="${l.color}" stroke-dasharray="${l.dash || '4 3'}"/>`; if (l.label) h += `<text class="lbl" x="${W-m.r-2}" y="${+y-3}" text-anchor="end" fill="${l.color}">${esc(l.label)}</text>`; });
+  (o.vlines||[]).forEach(l => { if (l.x < x0 || l.x > x1) return; const x = sx(l.x).toFixed(1); h += `<line y1="${m.t}" y2="${H-m.b}" x1="${x}" x2="${x}" stroke="${l.color}" stroke-dasharray="3 3"/>`; if (l.label) h += `<text class="lbl" x="${+x+3}" y="${m.t+10}" fill="${l.color}">${esc(l.label)}</text>`; });
+  (o.markers||[]).forEach(k => { if (!Number.isFinite(k.y) || k.x < x0 || k.x > x1) return; const x = sx(k.x), y = sy(k.y), r = k.r || 4;
+    if (k.shape === 'up') h += `<path d="M${x} ${y-r} L${x+r} ${y+r} L${x-r} ${y+r}Z" fill="${k.color}"/>`;
+    else if (k.shape === 'down') h += `<path d="M${x} ${y+r} L${x+r} ${y-r} L${x-r} ${y-r}Z" fill="${k.color}"/>`;
+    else h += `<circle cx="${x}" cy="${y}" r="${r}" fill="${k.hollow ? 'white' : k.color}" stroke="${k.color}" stroke-width="1.5"/>`; });
+  if (o.cursor != null && o.cursor >= x0 && o.cursor <= x1){ const x = sx(o.cursor).toFixed(1); h += `<line y1="${m.t}" y2="${H-m.b}" x1="${x}" x2="${x}" stroke="#111827" stroke-width="1" opacity="0.7"/>`;
+    (o.series||[]).forEach(s => { const v = s.ys[o.cursor]; if (Number.isFinite(v)) h += `<circle cx="${x}" cy="${sy(v).toFixed(1)}" r="3" fill="${s.color}"/>`; }); }
+  if (o.title) h += `<text class="ttl" x="${m.l}" y="15">${esc(o.title)}</text>`;
+  const leg = [...(o.series||[]), ...(o.stacks||[]), ...(o.bands||[])].filter(s => s.label);
+  if (leg.length){ let x = W - m.r; let lh = ''; leg.slice().reverse().forEach(s => { const tw = s.label.length * 6.2 + 18; x -= tw; lh += `<line x1="${x}" x2="${x+12}" y1="${m.t-8}" y2="${m.t-8}" stroke="${s.color}" stroke-width="2.5"${s.dash ? ' stroke-dasharray="4 3"' : ''}/><text class="lbl" x="${x+15}" y="${m.t-5}" fill="#374151">${esc(s.label)}</text>`; }); h += lh; }
+  svg.innerHTML = h;
+}
+
+/* Масштаб кривой спроса по умолчанию для агента j: по всему прогону,
+   чтобы оси не менялись от тика к тику. x — отклонение Π от опоры
+   (mid у транслятора, 1 у арбитражёра), y — нотионал V. */
+function demandDefault(j){
+  if (S.dscaleDef[j]) return S.dscaleDef[j];
+  const ser = S.ser, a = S.meta.agents[j], isT = a.kind === 'T1' || a.kind === 'T2';
+  // λ меняется на порядки (глубина книги), единого «диагонального» масштаба
+  // нет. Калибруем по медианной λ: y — 90% нотионалов клиринга, x — такой,
+  // чтобы при медианной λ линия шла из угла в угол (x = y·ref/λ_med); круче
+  // диагонали = агрессивнее обычного, положе = тоньше книга. Смещения z
+  // (95%) тоже должны помещаться.
+  const xsAll = [], zs = [], ys = [], lams = [];
+  for (let t = 0; t < S.N; t++){ const pd = ser.piDev[j][t]; if (!Number.isFinite(pd)) continue;
+    xsAll.push(Math.abs(pd)); zs.push(Math.abs(ser.zDev[j][t])); lams.push(ser.lamEff[j][t]);
+    if (ser.fillAbs[j][t] > 0) ys.push(Math.abs(ser.fillV[j][t])); }
+  const q = (arr, p) => { if (!arr.length) return 0; const s = arr.slice().sort((x, y) => x - y); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; };
+  const refv = isT ? q(Array.from(ser.mid[a.kind === 'T1' ? 0 : 1]).filter(Number.isFinite), 0.5) : 1;
+  const lamMed = q(lams, 0.5);
+  let yh = q(ys, 0.9) * 1.2;
+  let xh = yh > 0 && lamMed > 0 ? yh * refv / lamMed : q(xsAll, 0.9) * 1.2;
+  xh = Math.max(xh, q(zs, 0.95) * 1.2); if (!(xh > 0)) xh = refv * 1e-3;
+  if (!(yh > 0)) yh = lamMed * xh / refv || 1;
+  return (S.dscaleDef[j] = {xh, yh, xc:0, yc:0});
+}
+function demandScale(j){ return S.dscale[j] || {...demandDefault(j)}; }
+
+/* Кривая спроса одной заявки: V(Π) = λ·ln(z/Π) в координатах (Π − опора, V).
+   Масштаб фиксированный (sc), поэтому от тика к тику двигается кривая,
+   а не оси; точка клиринга вне поля показывается стрелкой у края. */
+function demandChart(svg, d, sc){
+  const W = svg.clientWidth || 320, H = svg.clientHeight || 190;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  const m = {l:58, r:12, t:12, b:26}, iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const x0 = sc.xc - sc.xh, x1 = sc.xc + sc.xh, y0 = sc.yc - sc.yh, y1 = sc.yc + sc.yh;
+  const sx = x => m.l + (x - x0) / (x1 - x0) * iw, sy = y => m.t + (y1 - y) / (y1 - y0) * ih;
+  const inX = x => x >= x0 && x <= x1, inY = y => y >= y0 && y <= y1;
+  const clip = `dclip-${d.j}`;
+  let h = `<clipPath id="${clip}"><rect x="${m.l}" y="${m.t}" width="${iw}" height="${ih}"/></clipPath>`;
+  const yst = niceStep(y1 - y0, 4);
+  ticksFor(y0, y1, 4).forEach(v => { const y = sy(v).toFixed(1); h += `<line class="grid-line" x1="${m.l}" x2="${W-m.r}" y1="${y}" y2="${y}"/><text class="ax" x="${m.l-5}" y="${+y+3.5}" text-anchor="end">${fmtTick(v, yst)}</text>`; });
+  const xst = niceStep(x1 - x0, 4);
+  ticksFor(x0, x1, 4).forEach(v => { const x = sx(v).toFixed(1); h += `<line class="grid-line" y1="${m.t}" y2="${H-m.b}" x1="${x}" x2="${x}"/><text class="ax" x="${x}" y="${H-9}" text-anchor="middle">${fmtTick(v, xst)}</text>`; });
+  if (inY(0)) h += `<line x1="${m.l}" x2="${W-m.r}" y1="${sy(0)}" y2="${sy(0)}" stroke="#9ca3af"/>`;
+  if (inX(0)) h += `<line y1="${m.t}" y2="${H-m.b}" x1="${sx(0)}" x2="${sx(0)}" stroke="#6b7280" stroke-dasharray="4 3"/>`;
+  if (d.refLabel !== '1' && inX(0)) h += `<text class="ax" x="${sx(0)+4}" y="${m.t+9}" fill="#6b7280">${esc(d.refLabel)} ${fmt(d.ref, 3)}</text>`;
+  h += `<text class="ax" x="${m.l+3}" y="${m.t+9}">V, X1/тик</text>`;
+  h += `<text class="ax" x="${W-m.r-24}" y="${m.t+9}" text-anchor="end" font-style="italic">${esc(d.xLabel)}</text>`;
+  h += `<text class="reset" x="${W-m.r}" y="${m.t+11}" text-anchor="end" font-size="14" fill="#6b7280" style="cursor:pointer"><title>сбросить масштаб (или двойной клик)</title>⟲</text>`;
+  if (!d.has){ h += `<text class="ax" x="${m.l + iw/2}" y="${m.t + ih/2}" text-anchor="middle">нет заявки</text>`; svg.innerHTML = h; return; }
+  // кривая: V(x) = λ·ln(z/(ref + x)); наклон около z равен −λ/z
+  const Vf = x => d.lam * Math.log(d.z / (d.ref + x));
+  let p = '', pen = false;
+  for (let i = 0; i <= 64; i++){ const x = x0 + (x1 - x0) * i / 64; if (d.ref + x <= 0){ pen = false; continue; } p += (pen ? 'L' : 'M') + sx(x).toFixed(1) + ' ' + sy(Vf(x)).toFixed(1); pen = true; }
+  h += `<g clip-path="url(#${clip})"><path d="${p}" fill="none" stroke="${d.color}" stroke-width="2"/>`;
+  const zx = d.z - d.ref, ax = d.piA - d.ref, bx = d.piB - d.ref;
+  if (inX(zx) && inY(0)) h += `<circle cx="${sx(zx)}" cy="${sy(0)}" r="4" fill="white" stroke="${d.color}" stroke-width="1.6"/><text class="lbl" x="${sx(zx)}" y="${sy(0)-7}" text-anchor="middle" fill="${d.color}">z</text>`;
+  if (Number.isFinite(bx) && inX(bx) && inY(Vf(bx))) h += `<circle cx="${sx(bx)}" cy="${sy(Vf(bx))}" r="3.5" fill="white" stroke="#6b7280" stroke-width="1.3"><title>Π до клиринга ${fmt(d.piB)}</title></circle>`;
+  if (Number.isFinite(ax) && inX(ax) && inY(d.V)){ const x = sx(ax), y = sy(d.V); h += `<line x1="${x}" x2="${x}" y1="${sy(Math.max(y0, Math.min(y1, 0)))}" y2="${y}" stroke="${d.color}" stroke-dasharray="2 2"/><circle cx="${x}" cy="${y}" r="5" fill="${d.color}"/>`;
+    const left = x > m.l + iw * 0.55; h += `<text class="lbl" x="${left ? x-8 : x+8}" y="${y + (d.V >= 0 ? -6 : 12)}" text-anchor="${left ? 'end' : 'start'}" fill="#111827">V=${sgn(d.V)}</text>`; }
+  h += `</g>`;
+  // точки вне поля: стрелка у края в их сторону + значения
+  const edge = (x, y, text, color) => { if (!Number.isFinite(x) || !Number.isFinite(y) || (inX(x) && inY(y))) return;
+    const px = Math.max(m.l + 6, Math.min(W - m.r - 6, sx(x))), py = Math.max(m.t + 6, Math.min(H - m.b - 6, sy(y)));
+    const dx = sx(x) - px, dy = sy(y) - py, len = Math.hypot(dx, dy) || 1, ux = dx / len, uy = dy / len;
+    h += `<path d="M${px - ux*9 - uy*5} ${py - uy*9 + ux*5} L${px} ${py} L${px - ux*9 + uy*5} ${py - uy*9 - ux*5}Z" fill="${color}"/>`;
+    const tw = text.length * 6; let tx = px + 12; if (tx + tw > W - m.r) tx = Math.max(m.l, Math.min(px - 12 - tw, W - m.r - tw));
+    h += `<text class="lbl" x="${tx}" y="${Math.max(m.t + 22, Math.min(H - m.b - 8, py + 4))}" fill="${color}" style="paint-order:stroke;stroke:#fff;stroke-width:3px">${esc(text)}</text>`; };
+  edge(ax, d.V, `клиринг: Π−${d.refLabel} ${sgn(ax, 4)}, V=${sgn(d.V)}`, d.color);
+  edge(zx, 0, `z−${d.refLabel} ${sgn(zx, 4)}`, d.color);
+  svg.innerHTML = h;
+}
+
+/* Управление масштабом кривой спроса: колёсико — масштаб (Shift — только x,
+   Alt — только y), перетаскивание — сдвиг, двойной клик или ⟲ — сброс. */
+function redrawDemand(j){ const svg = document.querySelector(`#agents svg.demand[data-j="${j}"]`); if (svg && S.lastDemand[j]) demandChart(svg, S.lastDemand[j], demandScale(j)); }
+(function demandControls(){
+  const box = $('#agents'); let drag = null;
+  const target = e => { const svg = e.target.closest && e.target.closest('svg.demand'); return svg ? +svg.dataset.j : null; };
+  box.addEventListener('wheel', e => { const j = target(e); if (j == null) return; e.preventDefault();
+    const sc = {...demandScale(j)}, f = e.deltaY > 0 ? 1.25 : 0.8;
+    if (!e.altKey) sc.xh *= f; if (!e.shiftKey) sc.yh *= f; S.dscale[j] = sc; redrawDemand(j); }, {passive:false});
+  box.addEventListener('mousedown', e => { const j = target(e); if (j == null || e.button !== 0) return;
+    const svg = e.target.closest('svg.demand'), sc = demandScale(j);
+    drag = {j, x:e.clientX, y:e.clientY, xc:sc.xc, yc:sc.yc, sc, w:svg.clientWidth - 70, h:svg.clientHeight - 38, moved:false}; e.preventDefault(); });
+  document.addEventListener('mousemove', e => { if (!drag) return; const dx = e.clientX - drag.x, dy = e.clientY - drag.y; if (Math.abs(dx) + Math.abs(dy) < 2) return; drag.moved = true;
+    S.dscale[drag.j] = {...drag.sc, xc: drag.xc - dx / drag.w * 2 * drag.sc.xh, yc: drag.yc + dy / drag.h * 2 * drag.sc.yh}; redrawDemand(drag.j); });
+  document.addEventListener('mouseup', () => { drag = null; });
+  box.addEventListener('dblclick', e => { const j = target(e); if (j == null) return; delete S.dscale[j]; redrawDemand(j); });
+  box.addEventListener('click', e => { if (!e.target.classList.contains('reset')) return; const j = target(e); if (j == null) return; delete S.dscale[j]; redrawDemand(j); });
+})();
+
+/* Коридор хеджа: числовая ось стоимости позиции, полоса ±q*, до/после. */
+function corridorChart(svg, d){
+  const W = svg.clientWidth || 400, H = svg.clientHeight || 74;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  const m = {l:14, r:14}, iw = W - m.l - m.r, yl = 38;
+  let L = Math.max(d.qstar || 0, Math.abs(d.qValue), Math.abs(d.qAfterValue)) * 1.25; if (!(L > 0)) L = 1;
+  const sx = v => m.l + (v + L) / (2 * L) * iw;
+  let h = '';
+  if (d.qstar != null){ h += `<rect x="${sx(-d.qstar)}" y="${yl-12}" width="${sx(d.qstar)-sx(-d.qstar)}" height="24" fill="#16a34a" opacity="0.15"/>`;
+    h += `<text class="ax" x="${sx(-d.qstar)}" y="${yl+24}" text-anchor="middle">−q*=${fmt(-d.qstar,3)}</text><text class="ax" x="${sx(d.qstar)}" y="${yl+24}" text-anchor="middle">+q*=${fmt(d.qstar,3)}</text>`; }
+  h += `<line x1="${m.l}" x2="${W-m.r}" y1="${yl}" y2="${yl}" stroke="#9ca3af"/>`;
+  h += `<line x1="${sx(0)}" x2="${sx(0)}" y1="${yl-14}" y2="${yl+14}" stroke="#9ca3af"/><text class="ax" x="${sx(0)}" y="${yl+24}" text-anchor="middle">0</text>`;
+  if (d.hedged){ h += `<line x1="${sx(d.qValue)}" x2="${sx(d.qAfterValue)}" y1="${yl}" y2="${yl}" stroke="${d.color}" stroke-width="3"/>`;
+    h += `<circle cx="${sx(d.qValue)}" cy="${yl}" r="5" fill="white" stroke="${d.color}" stroke-width="1.6"/><circle cx="${sx(d.qAfterValue)}" cy="${yl}" r="5" fill="${d.color}"/>`;
+    const xm = (sx(d.qValue) + sx(d.qAfterValue)) / 2, anchor = xm < m.l + iw * 0.25 ? 'start' : xm > m.l + iw * 0.75 ? 'end' : 'middle';
+    h += `<text class="lbl" x="${xm}" y="${yl-16}" text-anchor="${anchor}" fill="#374151">после клиринга ${fmt(d.qValue,3)} <tspan fill="${d.color}">→ после хеджа ${fmt(d.qAfterValue,3)}</tspan></text>`;
+  } else { h += `<circle cx="${sx(d.qValue)}" cy="${yl}" r="5" fill="${d.color}"/><text class="lbl" x="${sx(d.qValue)}" y="${yl-16}" text-anchor="middle" fill="#374151">|q|·mid = ${fmt(d.qValue,3)}</text>`; }
+  svg.innerHTML = h;
+}
+
+/* Схема стакана: цена по вертикали, объём bid влево / ask вправо. */
+function bookChart(svg, d){
+  const W = svg.clientWidth || 500, H = svg.clientHeight || 420;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  const m = {l:62, r:10, t:40, b:10}, iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const bids = d.book.bids || [], asks = d.book.asks || [];
+  const prices = [...bids.map(l => l[0]), ...asks.map(l => l[0]), d.mid, d.ce, d.z, d.fund, d.hedge ? d.hedge.avg_price : NaN].filter(Number.isFinite);
+  let lo = Math.min(...prices), hi = Math.max(...prices); if (!(hi > lo)){ lo = d.mid - 1; hi = d.mid + 1; }
+  const pad = (hi - lo) * 0.06; lo -= pad; hi += pad;
+  const vmax = Math.max(1e-9, ...bids.map(l => l[1]), ...asks.map(l => l[1]));
+  const cx = m.l + iw / 2, halfw = iw / 2 - 46;
+  const sy = p => m.t + (hi - p) / (hi - lo) * ih, bx = v => v / vmax * halfw;
+  const bh = Math.min(11, Math.max(5, ih / ((hi - lo) / d.tick)));
+  let h = '';
+  const yst = niceStep(hi - lo, 8);
+  ticksFor(lo, hi, 8).forEach(v => { const y = sy(v).toFixed(1); h += `<line class="grid-line" x1="${m.l}" x2="${W-m.r}" y1="${y}" y2="${y}"/><text class="ax" x="${m.l-6}" y="${+y+3.5}" text-anchor="end">${fmtTick(v, yst)}</text>`; });
+  h += `<line x1="${cx}" x2="${cx}" y1="${m.t}" y2="${H-m.b}" stroke="#cfd4dc"/>`;
+  const level = (p, v, side) => { const y = sy(p) - bh / 2, w = bx(v); const x = side === 'bid' ? cx - w : cx;
+    h += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${bh.toFixed(1)}" fill="${side === 'bid' ? COL.bid : COL.ask}" opacity="0.55"/>`;
+    h += `<text class="ax" x="${side === 'bid' ? cx - w - 3 : cx + w + 3}" y="${(y + bh/2 + 3.5).toFixed(1)}" text-anchor="${side === 'bid' ? 'end' : 'start'}">${fmt(v, 2)}</text>`; };
+  bids.forEach(l => level(l[0], l[1], 'bid')); asks.forEach(l => level(l[0], l[1], 'ask'));
+  if (d.hedge){ // съеденные хеджем уровни: sell идёт по bid, buy — по ask
+    const side = d.hedge.side === 'sell' ? 'bid' : 'ask'; let rem = d.hedge.filled;
+    for (const [p, v] of (side === 'bid' ? bids : asks)){ if (rem <= 1e-12) break; const take = Math.min(rem, v); const w = bx(take), y = sy(p) - bh / 2;
+      h += `<rect x="${(side === 'bid' ? cx - w : cx).toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${bh.toFixed(1)}" fill="${side === 'bid' ? COL.bid : COL.ask}"/>`; rem -= take; }
+  }
+  // горизонтали: линии рисуем сразу, подписи раскладываем так, чтобы не
+  // накладывались (они обычно в паре тиков друг от друга у мида)
+  const labels = [];
+  const hline = (p, color, label, dash, right) => { if (!Number.isFinite(p)) return; const y = sy(p);
+    h += `<line x1="${m.l}" x2="${W-m.r}" y1="${y.toFixed(1)}" y2="${y.toFixed(1)}" stroke="${color}"${dash ? ` stroke-dasharray="${dash}"` : ''} stroke-width="1.2"/>`;
+    labels.push({y, color, label, right}); };
+  hline(d.fund, '#111827', `фундаментальная ${fmt(d.fund,3)}`, '2 3', false);
+  hline(d.mid, '#111827', `mid ${fmt(d.mid,3)}`, null, false);
+  if (d.hedge) hline(d.hedge.avg_price, '#b45309', `хедж ${d.hedge.side} ${fmt(d.hedge.filled,4)} шт @ ${fmt(d.hedge.avg_price,3)}`, '6 2', false);
+  hline(d.ce, d.ceColor, `CE ${fmt(d.ce,3)}`, '5 3', true);
+  hline(d.z, d.zColor, `z ${d.zLabel} ${fmt(d.z,3)}`, '1 3', true);
+  [false, true].forEach(side => {
+    const ls = labels.filter(l => l.right === side).sort((a, b) => a.y - b.y);
+    let prev = -Infinity; ls.forEach(l => { l.ty = Math.max(l.y - 3, prev + 12, m.t + 10); prev = l.ty; });
+    // если уехали за низ — сдвигаем всю пачку вверх
+    const over = ls.length ? ls[ls.length-1].ty - (H - m.b - 2) : 0; if (over > 0) ls.forEach(l => l.ty -= over);
+    ls.forEach(l => { const x = side ? W - m.r - 2 : m.l + 2;
+      if (Math.abs(l.ty - (l.y - 3)) > 4) h += `<line x1="${side ? x - 1 : x + 1}" x2="${side ? x - 1 : x + 1}" y1="${l.y.toFixed(1)}" y2="${(l.ty + 2).toFixed(1)}" stroke="${l.color}" stroke-width="0.8"/>`;
+      h += `<text class="lbl" x="${x}" y="${l.ty.toFixed(1)}" text-anchor="${side ? 'end' : 'start'}" fill="${l.color}" style="paint-order:stroke;stroke:#fff;stroke-width:3px">${esc(l.label)}</text>`; });
+  });
+  h += `<text class="ttl" x="${m.l}" y="15">${esc(d.title)}</text>`;
+  h += `<text class="ax" x="${cx-6}" y="${m.t-8}" text-anchor="end" fill="${COL.bid}">bid (покупка) ←</text><text class="ax" x="${cx+6}" y="${m.t-8}" fill="${COL.ask}">→ ask (продажа)</text>`;
+  svg.innerHTML = h;
+}
+
+// ------------------------------------------------------------- вычисления
+function rateOf(prices, w){ let s = 0; for (const [a, x] of Object.entries(w)) s += x * Math.log(prices[a]); return Math.exp(s); }
+function revalOf(prevBal, pB, pA){ let s = 0; for (const [a, q] of Object.entries(prevBal || {})) s += q * (pA[a] - pB[a]); return s; }
+
+/* Всё про хедж транслятора j на тике: коридор, решение, исполнение. */
+function hedgeInfo(R, Rp, j){
+  const a = S.meta.agents[j], cfg = S.meta.config, v = a.kind === 'T1' ? '1' : '2', e = R.world.venues[v];
+  const yAsset = a.kind === 'T1' ? 'Y1' : 'Y2', tick = cfg.tick_size, mid = e.mid;
+  const cost = e.spread == null ? null : 0.5 * Math.max(e.spread, tick) / mid;
+  const rec = R.agents[j], prev = Rp ? Rp.agents[j] : null;
+  const qBefore = prev ? (prev.balances[yAsset] || 0) : 0;
+  const fill = R.fills.find(f => f.agent === a.name), dq = fill ? (fill.quantities[yAsset] || 0) : 0;
+  const qClear = qBefore + dq, qAfter = rec.balances[yAsset] || 0;
+  const pB = Rp ? Rp.ce.prices : R.ce.prices, pA = R.ce.prices;
+  const eqClear = (prev ? prev.equity : 0) + (prev ? revalOf(prev.balances, pB, pA) : 0);
+  const C = cfg.c0 + eqClear, sigma2 = e.volatility * e.volatility;
+  const g = a.h_r * S.meta.gamma * sigma2 / Math.max(C, cfg.capital_floor_frac * cfg.c0);
+  const qstar = (cost != null && g > 0) ? cost / g : null;
+  const qValue = qClear * mid, excess = qstar == null ? null : Math.abs(qValue) - qstar;
+  const hs = R.hedges.filter(h => h.agent === a.name);
+  return {a, v, e, mid, cost, g, sigma2, qstar, qBefore, qClear, qAfter, qValue, qAfterValue: qAfter * mid, excess, hs, yAsset, C, active: rec.active};
+}
+
+// --------------------------------------------------------------- рендер
+function render(){
+  if (!S.ser) return;
+  const t = S.t, R = getTick(t), Rp = t > 0 ? getTick(t - 1) : null, ser = S.ser, [x0, x1] = windowRange();
+  renderPrices(x0, x1); renderNow(R, Rp); renderAgents(R, Rp); renderHedge(R, Rp, x0, x1); renderDynamics(x0, x1); renderBooks(R);
+}
+
+function renderPrices(x0, x1){
+  const ser = S.ser;
+  lineChart($('#ch-prices'), {x0, x1, cursor:S.t,
+    series:[{ys:ser.fund, color:COL.fund, width:1.6}, {ys:ser.anchor, color:COL.anchor, dash:'3 3'},
+            {ys:ser.mid[0], color:COL.v1}, {ys:ser.mid[1], color:COL.v2},
+            {ys:ser.ceY1, color:COL.ce1, dash:'5 3'}, {ys:ser.ceY2X2, color:COL.ce2, dash:'5 3'}],
+    vlines:S.deaths.map(d => ({x:d.t, color:COL[d.kind], label:'✝ ' + d.name}))});
+}
+
+function renderNow(R, Rp){
+  const w = R.world, ce = R.ce, p = ce.prices, pp = Rp ? Rp.ce.prices : p;
+  const row = (k, v, c) => `<tr><td class="muted">${k}</td><td class="num ${c||''}">${v}</td></tr>`;
+  const hdr = k => `<tr class="h"><td colspan="2">${k}</td></tr>`;
+  let h = `<table class="now">`;
+  h += hdr(`тик ${R.t}`);
+  h += row('фундаментальная', fmt(w.fundamental, 4)) + row('якорь', fmt(w.anchor, 4));
+  ['1','2'].forEach(v => { const e = w.venues[v];
+    h += hdr(`биржа ${v}`);
+    h += row('mid / last', `${fmt(e.mid,3)} / ${fmt(e.last_price,3)}`);
+    h += row('bid / ask', `${fmt(e.best_bid,2)} / ${fmt(e.best_ask,2)}`);
+    h += row('спред', fmt(e.spread, 2) + (e.spread != null ? ` (${Math.round(e.spread / S.meta.config.tick_size)} т.)` : ''));
+    h += row('глубина у мида', fmt(e.depth, 2) + ` · объём аукциона ${fmt(e.auction_volume, 2)}`);
+    h += row('волатильность', e.volatility.toExponential(2)); });
+  h += hdr('CE после клиринга');
+  h += row('Y1', `${fmt(p.Y1,4)} <span class="muted">(${sgn(p.Y1 - pp.Y1)})</span> · vs mid1 ${sgn(p.Y1 - w.venues['1'].mid, 4)}`);
+  h += row('Y2 / X2', `${fmt(p.Y2 / p.X2,4)} <span class="muted">(${sgn(p.Y2/p.X2 - pp.Y2/pp.X2)})</span> · vs mid2 ${sgn(p.Y2 / p.X2 - w.venues['2'].mid, 4)}`);
+  h += row('X2 (в X1)', `${fmt(p.X2,6)} · базис AX = X1/X2 − 1: ${sgn(p.X1/p.X2 - 1)}`);
+  h += row('Y2 (в X1)', `${fmt(p.Y2,4)} · базис AY = Y1/Y2 − 1: ${sgn(p.Y1/p.Y2 - 1)}`);
+  if (ce.gross_notional != null){
+    h += row('оборот за тик', fmt(ce.gross_notional) + ' X1');
+    h += row('ранг / невязка', `${ce.rank} / ${ce.max_value_imbalance.toExponential(1)} · итераций кап: ${ce.cap_iterations}`);
+    h += row('заявок / филлов', `${R.orders.length} / ${R.fills.length} · хеджей ${R.hedges.length}`);
+  }
+  const alive = R.agents.filter(a => a.active).length;
+  h += hdr('популяция');
+  h += row('живы', `${alive} из ${R.agents.length}` + (S.deaths.length ? ` · смерти: ${S.deaths.map(d => `${d.name}@${d.t}`).join(', ')}` : ''));
+  h += row('Σ PnL', sgn(R.agents.reduce((s, a) => s + a.equity, 0)) + ' X1');
+  h += `</table>`;
+  $('#now').innerHTML = h;
+}
+
+function renderAgents(R, Rp){
+  const meta = S.meta, pB = Rp ? Rp.ce.prices : R.ce.prices, pA = R.ce.prices;
+  const cards = [], charts = [];
+  meta.agents.forEach((a, j) => {
+    const st = R.agents[j], sp = Rp ? Rp.agents[j] : null, color = COL[a.kind];
+    const o = R.orders.find(o => o.agent === a.name), fill = R.fills.find(f => f.agent === a.name), hs = R.hedges.filter(h => h.agent === a.name);
+    const reval = sp ? revalOf(sp.balances, pB, pA) : 0, hv = hs.reduce((s, h) => s + h.value, 0), dEq = st.equity - (sp ? sp.equity : 0);
+    const isT = a.kind === 'T1' || a.kind === 'T2';
+    let h = `<div class="card agent" style="border-top-color:${color}">`;
+    h += `<div><b>${esc(a.name)}</b><span class="tag">${a.kind}</span>${st.active ? '<span class="tag alive">жив</span>' : `<span class="tag dead">умер @${st.death_tick}</span>`}`;
+    h += ` <span class="muted small">h_m=${a.h_m}${a.h_r != null ? ', h_R=' + a.h_r : ''}</span></div>`;
+    h += `<table class="kv">`;
+    h += `<tr><td>PnL (equity)</td><td class="num"><b class="${cls(st.equity)}">${sgn(st.equity)}</b> X1 &nbsp;<span class="muted small">Δ тика ${sgn(dEq)} = переоценка ${sgn(reval)} + хедж ${sgn(hv)}</span></td></tr>`;
+    h += `<tr><td>капитал</td><td class="num">${fmt(st.capital, 3)}</td></tr>`;
+    h += `</table>`;
+    // инвентарь: по активам, с изменением за тик (клиринг + хедж)
+    const hedgeDq = {};
+    hs.forEach(x => { const y = a.kind === 'T1' ? 'Y1' : 'Y2', c = a.kind === 'T1' ? 'X1' : 'X2', s = x.side === 'sell' ? -1 : 1;
+      hedgeDq[y] = (hedgeDq[y] || 0) + s * x.filled; hedgeDq[c] = (hedgeDq[c] || 0) - s * x.total_cost; });
+    const names = Array.from(new Set([st.leg, ...Object.keys(st.balances), ...(sp ? Object.keys(sp.balances) : [])]));
+    h += `<table class="inv"><tr><th>инвентарь</th><th>количество, шт</th><th>в X1</th><th>Δ за тик, шт</th></tr>`;
+    let total = 0;
+    names.forEach(asset => {
+      const q = st.balances[asset] || 0, qp = sp ? (sp.balances[asset] || 0) : 0, dq = q - qp;
+      const df = fill ? (fill.quantities[asset] || 0) : 0, dh = hedgeDq[asset] || 0, val = q * pA[asset]; total += val;
+      let dcell = `<span class="${cls(dq)}">${sq(dq)}</span>`;
+      if (dh) dcell += `<div class="small">клиринг <span class="${cls(df)}">${sq(df)}</span></div><div class="small">хедж <span class="${cls(dh)}">${sq(dh)}</span></div>`;
+      const leg = asset === st.leg;
+      h += `<tr${leg ? ' class="leg"' : ''}><td>${asset}${leg ? ' <span class="muted small">торгуемая нога</span>' : ''}</td><td class="num q ${cls(q)}">${sq(q)}</td><td class="num ${cls(val)}">${sgn(val, 4)}</td><td class="num">${dcell}</td></tr>`; });
+    h += `<tr class="tot"><td>итого</td><td></td><td class="num ${cls(total)}">${sgn(total, 4)}</td><td>${st.active ? '= PnL' : ''}</td></tr></table>`;
+    // заявка
+    h += `<div class="sub">Заявка</div>`;
+    const xLabel = isT ? `Π − mid, ${a.kind === 'T1' ? 'X1' : 'X2'}` : 'Π − 1';
+    const refNow = isT ? R.world.venues[a.kind === 'T1' ? '1' : '2'].mid : 1;
+    let dc = {j, color, has:false, ref:refNow, refLabel: isT ? 'mid' : '1', xLabel};
+    if (o){
+      const mt = o.meta || {}, lamEff = o.lam * (o.lam_ccy ? pB[o.lam_ccy] : 1), piA = rateOf(pA, o.weights), piB = rateOf(pB, o.weights), V = fill ? fill.notional : 0;
+      const wtxt = Object.entries(o.weights).map(([k, v]) => `${v > 0 ? '+' : '−'}${k}`).join(' ');
+      h += `<table class="kv">`;
+      if (isT){
+        h += `<tr><td>z</td><td class="num">${fmt(o.z, 4)} <span class="muted small">mid ${fmt(mt.mid, 4)}, сдвиг ${sgn(o.z - mt.mid, 4)} (${fmt((o.z - mt.mid) / S.meta.config.tick_size, 1)} т.)</span></td></tr>`;
+        h += `<tr><td>λ</td><td class="num">${fmt(o.lam, 3)} ${o.lam_ccy}/тик <span class="muted small">= κ·H·доля/h_m; H=${fmt(mt.H, 2)}, доля ${fmt(mt.share, 3)}${o.lam_ccy !== 'X1' ? `; в X1: ${fmt(lamEff, 3)}` : ''}</span></td></tr>`;
+        h += `<tr><td>риск</td><td class="num small">g=${mt.g != null ? mt.g.toExponential(2) : '—'}, σ²=${mt.sigma2 != null ? mt.sigma2.toExponential(2) : '—'}, q=${sgn(mt.q_units)} шт (${sgn(mt.q_units * mt.mid, 4)} ${o.lam_ccy})</td></tr>`;
+        h += `<tr><td>стакан</td><td class="num small">спред ${fmt(mt.spread, 2)}, глубина ${fmt(mt.depth, 2)}, C=${fmt(mt.capital, 2)}</td></tr>`;
+      } else {
+        h += `<tr><td>z</td><td class="num">${fmt(o.z, 6)} <span class="muted small">сдвиг от 1: ${sgn(o.z - 1)}</span></td></tr>`;
+        h += `<tr><td>λ</td><td class="num">${fmt(o.lam, 3)} X1/тик <span class="muted small">= κ_A·C/h_m, C=${fmt(mt.capital, 2)}</span></td></tr>`;
+        h += `<tr><td>риск</td><td class="num small">g=${mt.g != null ? mt.g.toExponential(2) : '—'}, σ²(базис)=${mt.sigma2 != null ? mt.sigma2.toExponential(2) : '—'}, q·P=${sgn(mt.q_value, 4)} X1</td></tr>`;
+      }
+      h += `<tr><td>портфель</td><td class="num small">${wtxt}; Π до ${fmt(piB, isT ? 4 : 6)} → после ${fmt(piA, isT ? 4 : 6)}</td></tr>`;
+      h += `</table>`;
+      h += `<div class="sub">Клиринг</div>`;
+      if (fill){
+        h += `<div class="num">f = ${sgn(fill.f)} → V = <b class="${cls(V)}">${sgn(V)}</b> X1: ${Object.entries(fill.quantities).map(([k, v]) => `<span class="${cls(v)}">${k} ${sgn(v)}</span>`).join(', ')}</div>`;
+      } else h += `<div class="muted">филла нет (V = 0)</div>`;
+      Object.assign(dc, {has:true, z:o.z, lam:lamEff, piA, piB, V, ref: isT ? mt.mid : 1});
+    } else {
+      h += `<div class="muted">${st.active ? 'заявки нет (λ ≤ 0 или пустая книга)' : 'не торгует'}</div>`;
+    }
+    if (isT){
+      h += `<div class="sub">Хедж</div>`;
+      if (hs.length){ hs.forEach(x => { h += `<div class="num">${x.side === 'sell' ? 'продал' : 'купил'} ${fmt(x.filled, 5)} шт @ ${fmt(x.avg_price, 3)} <span class="muted small">(запрошено ${fmt(x.requested, 5)}, стоимость ${fmt(x.total_cost, 4)}, ≈${fmt(x.notional_mid, 4)} по mid)</span>; вклад в PnL <b class="${cls(x.value)}">${sgn(x.value)}</b></div>`; }); }
+      else h += `<div class="muted">нет</div>`;
+    }
+    h += `<svg class="demand" data-j="${j}"></svg></div>`;
+    cards.push(h); charts.push(dc); S.lastDemand[j] = dc;
+  });
+  $('#agents').innerHTML = cards.join('');
+  document.querySelectorAll('#agents svg.demand').forEach(svg => { const j = +svg.dataset.j; demandChart(svg, charts[j], demandScale(j)); });
+}
+
+function renderHedge(R, Rp, x0, x1){
+  const ser = S.ser, meta = S.meta; let html = ''; const infos = [];
+  meta.agents.forEach((a, j) => {
+    if (a.kind !== 'T1' && a.kind !== 'T2') return;
+    const d = hedgeInfo(R, Rp, j), color = COL[a.kind], cash = a.kind === 'T1' ? 'X1' : 'X2'; infos.push([j, d]);
+    let h = `<div class="card" style="border-top:3px solid ${color}"><div><b>${esc(a.name)}</b> <span class="muted small">биржа ${d.v}, нога ${d.yAsset}, кэш ${cash}</span></div>`;
+    h += `<svg class="corridor"></svg>`;
+    h += `<table class="kv">`;
+    h += `<tr><td>стоимость хеджа</td><td class="num">cost = ½·max(спред, тик)/mid = ${d.cost != null ? d.cost.toExponential(3) : '— (нет встречной стороны)'}</td></tr>`;
+    h += `<tr><td>риск</td><td class="num">g = h_R·γ·σ²/C = ${d.g.toExponential(3)} <span class="muted small">(σ²=${d.sigma2.toExponential(2)}, C после клиринга ${fmt(d.C, 2)})</span></td></tr>`;
+    h += `<tr><td>порог</td><td class="num">q* = cost/g = ${d.qstar != null ? fmt(d.qstar, 4) : '—'} ${cash} <span class="muted small">(${d.qstar != null ? fmt(d.qstar / d.mid, 5) : '—'} шт)</span></td></tr>`;
+    h += `<tr><td>позиция</td><td class="num">до клиринга ${sgn(d.qBefore)} → после ${sgn(d.qClear)} шт = ${sgn(d.qValue, 4)} ${cash}</td></tr>`;
+    if (d.excess != null) h += `<tr><td>излишек</td><td class="num">|q|·mid − q* = <b class="${d.excess > 0 ? 'neg' : 'pos'}">${sgn(d.excess, 4)}</b> → ${d.excess > 0 ? `сбросить ${fmt(d.excess / d.mid, 5)} шт (${d.qClear > 0 ? 'продажа' : 'покупка'})` : 'хедж не нужен'}</td></tr>`;
+    if (d.hs.length) d.hs.forEach(x => {
+      const slip = x.side === 'sell' ? d.mid - x.avg_price : x.avg_price - d.mid;
+      h += `<tr><td>исполнено</td><td class="num">${x.side === 'sell' ? 'продажа' : 'покупка'} ${fmt(x.filled, 5)} из ${fmt(x.requested, 5)} шт @ ${fmt(x.avg_price, 3)} <span class="muted small">(mid ${fmt(d.mid, 3)}, проскальзывание ${fmt(slip, 3)} = ${d.e.spread ? fmt(slip / d.e.spread * 2, 2) : '—'} полуспреда)</span></td></tr>`;
+      h += `<tr><td>результат</td><td class="num">позиция после хеджа ${sgn(d.qAfter)} шт; вклад в PnL <b class="${cls(x.value)}">${sgn(x.value)}</b> X1; всего на хеджах ${sgn(ser.hedgeCum[j][S.t])} X1</td></tr>`; });
+    else if (d.excess != null && d.excess > 0 && d.active) h += `<tr><td>исполнено</td><td class="neg">хедж требовался, но не исполнен (стакан пуст на нужной стороне)</td></tr>`;
+    h += `</table></div>`; html += h;
+  });
+  $('#hedge').innerHTML = html;
+  document.querySelectorAll('#hedge svg.corridor').forEach((svg, i) => { const [j, d] = infos[i]; corridorChart(svg, {qstar:d.qstar, qValue:d.qValue, qAfterValue:d.qAfterValue, hedged:d.hs.length > 0, color:COL[meta.agents[j].kind]}); });
+  // графики во времени: позиция в коридоре ±q*, хеджи — треугольники
+  infos.forEach(([j, d]) => {
+    const a = meta.agents[j], color = COL[a.kind], neg = new Float64Array(S.N); for (let t = 0; t < S.N; t++) neg[t] = -ser.qstar[j][t];
+    const markers = []; for (let t = Math.max(0, x0); t <= Math.min(S.N - 1, x1); t++) if (ser.hedgeN[j][t] > 0) markers.push({x:t, y:ser.invHome[j][t], color:'#b45309', shape: ser.invHome[j][t] >= 0 ? 'down' : 'up', r:4});
+    lineChart($(`#ch-inv-${a.kind}`), {x0, x1, cursor:S.t, zero:true, title:`${a.kind}: позиция ${d.yAsset}·mid и коридор ±q* (${a.kind === 'T1' ? 'X1' : 'X2'})`,
+      bands:[{lo:neg, hi:ser.qstar[j], color:'#16a34a', label:'коридор ±q*', soft:true}], series:[{ys:ser.invHome[j], color, label:'q·mid'}], markers});
+  });
+  lineChart($('#ch-hedgecum'), {x0, x1, cursor:S.t, zero:true, title:'накопленный результат хеджей, X1',
+    series: infos.map(([j]) => ({ys:ser.hedgeCum[j], color:COL[meta.agents[j].kind], label:meta.agents[j].kind}))});
+}
+
+function renderDynamics(x0, x1){
+  const ser = S.ser, meta = S.meta, ag = meta.agents, t = S.t;
+  const deathV = S.deaths.map(d => ({x:d.t, color:COL[d.kind], label:'✝'}));
+  lineChart($('#ch-equity'), {x0, x1, cursor:t, zero:true, title:'PnL агентов, X1', vlines:deathV,
+    series: ag.map((a, j) => ({ys:ser.eq[j], color:COL[a.kind], label:a.kind}))});
+  lineChart($('#ch-inv'), {x0, x1, cursor:t, zero:true, title:'стоимость позиции по торгуемой ноге, X1',
+    series: ag.map((a, j) => ({ys:ser.inv[j], color:COL[a.kind], label:a.kind}))});
+  lineChart($('#ch-turnover'), {x0, x1, cursor:t, zero:true, title:'оборот CE за тик по агентам (|V|), X1',
+    stacks: ag.map((a, j) => ({ys:ser.fillAbs[j], color:COL[a.kind], label:a.kind}))});
+  lineChart($('#ch-cevsmid'), {x0, x1, cursor:t, zero:true, title:'цена CE минус mid домашней биржи',
+    series:[{ys:ser.cemid[0], color:COL.v1, label:'Y1 − mid1'}, {ys:ser.cemid[1], color:COL.v2, label:'Y2/X2 − mid2'}]});
+  lineChart($('#ch-basis'), {x0, x1, cursor:t, zero:true, title:'базисы арбитражёров: индекс − 1',
+    series:[{ys:ser.basisX, color:COL.AX, label:'AX: X1/X2 − 1'}, {ys:ser.basisY, color:COL.AY, label:'AY: Y1/Y2 − 1'}]});
+  lineChart($('#ch-z'), {x0, x1, cursor:t, zero:true, title:'шейдинг трансляторов: z − mid (сдвиг котировки против позиции)',
+    series: ag.filter(a => a.kind === 'T1' || a.kind === 'T2').map(a => ({ys:ser.zmid[S.idx[a.name]], color:COL[a.kind], label:a.kind}))});
+}
+
+function renderBooks(R){
+  const cfg = S.meta.config, p = R.ce.prices;
+  [['1', 'T1', p.Y1, COL.ce1, '#book1'], ['2', 'T2', p.Y2 / p.X2, COL.ce2, '#book2']].forEach(([v, kind, ce, ceColor, sel]) => {
+    const e = R.world.venues[v], tr = S.meta.agents.find(a => a.kind === kind), o = tr ? R.orders.find(x => x.agent === tr.name) : null;
+    const hedge = R.hedges.find(h => h.venue === v) || null;
+    bookChart($(sel), {book:e.book, mid:e.mid, fund:R.world.fundamental, ce, ceColor, z: o ? o.z : NaN, zColor:COL[kind], zLabel:kind,
+      hedge, tick:cfg.tick_size, title:`биржа ${v}: спред ${fmt(e.spread, 2)}, глубина у мида ${fmt(e.depth, 1)}, уровней ${e.book.bids.length}+${e.book.asks.length}`});
+  });
+}
+
+window.addEventListener('resize', () => { if (S.ser) render(); });
+</script>
+</body>
+</html>

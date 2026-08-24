@@ -36,6 +36,7 @@ import numpy as np
 
 import agent_formulas as F
 from coupled_market import CoupledMarket, ExchangeConfig
+from detail_log import DetailLog
 from pfx_exchange import Exchange as PortfolioExchange, Order
 
 
@@ -48,9 +49,9 @@ class SimConfig:
     # --- население: сетки гиперпараметров -------------------------------- #
     # трансляторы: все комбинации h_m x h_R (4x4 = 16 на площадку);
     # арбитражёры: по arb_copies копий на каждое h_m (4x4 = 16 на тип)
-    h_m_values: tuple = (0.55, 0.8, 1.0, 1.35)
-    h_r_values: tuple = (0.55, 0.8, 1.0, 1.35)
-    arb_copies: int = 4
+    h_m_values: tuple = (1.0, )
+    h_r_values: tuple = (1.0, )
+    arb_copies: int = 1
 
     # --- капитал и торговая мощность ------------------------------------- #
     # kappa подобраны так, чтобы обороты CE были заметны на фоне книг, а
@@ -82,6 +83,11 @@ class SimConfig:
     book_bin: float = 0.25          # ширина ценового бина среза
     report_dir: str = "report"      # каталог отчёта (tex, pdf, фигуры, кэш)
 
+    # --- детальный потиковый журнал (см. detail_log.py) -------------------- #
+    # каждая заявка, филл, хедж и состояние каждого агента; одна строка JSON
+    # на тик. Рассчитан на малые популяции. None — не писать.
+    detail_log_path: str | None = "detail_log.jsonl"
+
     # --- рынок -------------------------------------------------------------#
     seed: int | None = 7
     warmup: int = 200
@@ -89,17 +95,17 @@ class SimConfig:
     initial_price: float = 100.0
     # depth_band масштабируется вместе с price_std: полоса, в которой
     # считается глубина у мида, должна накрывать типичный разброс заявок
-    depth_band: float = 4.0
+    depth_band: float = 0.5
     anchor_half_life: float = 20.0
     # волатильность фундаментальной цены: лог-шок якоря за тик; уровень
     # цен блуждает как sigma_F * sqrt(T) (1e-3 -> ~11% за 12000 тиков)
-    fundamental_vol: float = 1e-3
+    fundamental_vol: float = 1e-2
     venue1: ExchangeConfig = field(default_factory=lambda: ExchangeConfig(
         name="1", arrival_rate=10.0, order_size=1.0, order_ttl=5,
-        price_std=3.0, ewma_half_life=10.0))
+        price_std=0.5, ewma_half_life=10.0))
     venue2: ExchangeConfig = field(default_factory=lambda: ExchangeConfig(
         name="2", arrival_rate=3.0, order_size=1.0, order_ttl=5,
-        price_std=3.0, ewma_half_life=10.0))
+        price_std=0.5, ewma_half_life=10.0))
 
     progress_every: int = 500    # период печати прогресса (0 — молча)
 
@@ -384,8 +390,8 @@ def submit_translator_orders(cfg: SimConfig, market: CoupledMarket,
         capitals = [F.capital(ce.mark_to_market(a.name), cfg.c0)
                     for a in members]
         for a, cap in zip(members, capitals):
-            lam = F.lam_translator(cfg.kappa_t, H, F.share(cap, capitals),
-                                   a.h_m)
+            share = F.share(cap, capitals)
+            lam = F.lam_translator(cfg.kappa_t, H, share, a.h_m)
             if lam <= 0.0:
                 continue
             g = F.risk_coefficient(a.h_r, gamma, sigma2, cap, floor)
@@ -393,10 +399,16 @@ def submit_translator_orders(cfg: SimConfig, market: CoupledMarket,
             z = F.shaded_quote(mid, g, q_units * mid, cfg.shading_clamp)
             # lam посчитана в кэше домашней площадки (H = depth*mid, а mid
             # у T2 выражен в X2); lam_ccy поручает бирже конвертацию в
-            # единицу счёта X1 по цене прошлого шага
+            # единицу счёта X1 по цене прошлого шага.
+            # meta — наблюдаемые величины момента подачи; движок её не
+            # трогает, детальный журнал пишет вместе с заявкой
             ce.submit(Order(weights=F.PORTFOLIOS[kind], z=z, lam=lam,
                             agent=a.name, lam_ccy=cash_asset,
-                            expiry=ce.t + 1.0))
+                            expiry=ce.t + 1.0,
+                            meta={"mid": mid, "spread": spread,
+                                  "sigma2": sigma2, "depth": depth, "H": H,
+                                  "capital": cap, "share": share, "g": g,
+                                  "q_units": q_units}))
 
 
 def submit_arb_orders(cfg: SimConfig, ce: PortfolioExchange,
@@ -415,14 +427,16 @@ def submit_arb_orders(cfg: SimConfig, ce: PortfolioExchange,
             lam = F.lam_arb(cfg.kappa_a, cap, a.h_m)
             if lam <= 0.0:
                 continue
-            z = 1.0
+            z, g, q_value = 1.0, None, None
             if cfg.arb_shading:
                 g = F.risk_coefficient(1.0, gamma, sigma2, cap, floor)
                 q_value = (ce.balances.get(a.name, {}).get(long_leg, 0.0)
                            * ce.price(long_leg))
                 z = F.shaded_quote(1.0, g, q_value, cfg.shading_clamp)
             ce.submit(Order(weights=F.PORTFOLIOS[kind], z=z, lam=lam,
-                            agent=a.name, expiry=ce.t + 1.0))
+                            agent=a.name, expiry=ce.t + 1.0,
+                            meta={"sigma2": sigma2, "capital": cap,
+                                  "g": g, "q_value": q_value}))
 
 
 def hedge_translators(cfg: SimConfig, market: CoupledMarket,
@@ -575,6 +589,13 @@ def run_simulation(cfg: SimConfig, verbose: bool = True) -> SimResult:
     rec.market(0, market)
     stats = rec.stats
 
+    # детальный журнал: перехват подач заявок и хеджей + строка на каждый тик
+    dlog = (DetailLog(cfg.detail_log_path, cfg, agents, gamma)
+            if cfg.detail_log_path else None)
+    if dlog is not None:
+        dlog.attach(ce, market, rec, agents)
+        dlog.tick(0, market, ce, agents, equity)
+
     # волатильность базисов для шейдинга арбитражёров (оценка по ценам CE)
     basis_vol = {
         kind: EwmaVar(cfg.arb_vol_half_life, ce.rate(F.PORTFOLIOS[kind]))
@@ -619,6 +640,9 @@ def run_simulation(cfg: SimConfig, verbose: bool = True) -> SimResult:
                  - equity[agents.index(dead), t - cfg.window]
             deaths.append((t, dead.name, loss))
 
+        if dlog is not None:
+            dlog.tick(t, market, ce, agents, equity, report)
+
         if verbose and cfg.progress_every and t % cfg.progress_every == 0:
             alive = Counter(a.kind for a in agents if a.active)
             print(f"t={t:>6}  Y1={ce.price('Y1'):8.3f}  Y2={ce.price('Y2'):8.3f}  "
@@ -628,6 +652,8 @@ def run_simulation(cfg: SimConfig, verbose: bool = True) -> SimResult:
                              for k in ("T1", "T2", "AX", "AY")))
 
     rec.finish()
+    if dlog is not None:
+        dlog.close()
     return SimResult(config=cfg, agents=agents, equity=equity,
                      inventory=inventory, deaths=deaths, ce_prices=ce_prices,
                      mids=mids, gross=gross, gamma=gamma, stats=stats,
