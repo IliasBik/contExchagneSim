@@ -1,6 +1,12 @@
 __pycache__
 Промпт.txt
 
+report/
+.vscode/
+
+detail_log.jsonl
+opt_log.csv
+
 # отчёт: всё пересобирается из кода одной командой (python make_report.py)
 report/cache/
 report/fonts/
