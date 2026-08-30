@@ -5,3 +5,6 @@ report/
 
 # детальный потиковый журнал (генерируется симуляцией)
 detail_log.jsonl
+
+opt_log.csv
+.vscode/

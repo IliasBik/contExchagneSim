@@ -46,11 +46,13 @@ from pfx_exchange import Exchange as PortfolioExchange, Order
 
 @dataclass
 class SimConfig:
-    # --- население: сетки гиперпараметров -------------------------------- #
-    # трансляторы: все комбинации h_m x h_R (4x4 = 16 на площадку);
-    # арбитражёры: по arb_copies копий на каждое h_m (4x4 = 16 на тип)
-    h_m_values: tuple = (1.0, )
-    h_r_values: tuple = (1.0, )
+    # --- население: индивидуальные сетки параметров --------------------- #
+    h_m1_values: tuple = (1.5868, )
+    h_r1_values: tuple = (100.00, )
+    h_m2_values: tuple = (0.0010, )
+    h_r2_values: tuple = (3.2641, )
+    h_mx_values: tuple = (0.0010, )
+    h_my_values: tuple = (0.0010, )
     arb_copies: int = 1
 
     # --- капитал и торговая мощность ------------------------------------- #
@@ -348,18 +350,33 @@ class Agent:
 
 
 def build_population(cfg: SimConfig) -> list[Agent]:
-    """Популяция: 16 T1 + 16 T2 + 16 AX + 16 AY при сетках по умолчанию."""
+    """Популяция: создается на основе индивидуальных сеток параметров из конфига."""
     agents: list[Agent] = []
-    for kind in ("T1", "T2"):
-        for hm in cfg.h_m_values:
-            for hr in cfg.h_r_values:
-                agents.append(Agent(name=f"{kind}[m={hm:g},r={hr:g}]",
-                                    kind=kind, h_m=hm, h_r=hr))
-    for kind in ("AX", "AY"):
-        for hm in cfg.h_m_values:
-            for copy in range(cfg.arb_copies):
-                agents.append(Agent(name=f"{kind}[m={hm:g}]#{copy + 1}",
-                                    kind=kind, h_m=hm))
+    
+    # Создание агентов T1
+    for hm in cfg.h_m1_values:
+        for hr in cfg.h_r1_values:
+            agents.append(Agent(name=f"T1[m={hm:g},r={hr:g}]",
+                                kind="T1", h_m=hm, h_r=hr))
+                                
+    # Создание агентов T2
+    for hm in cfg.h_m2_values:
+        for hr in cfg.h_r2_values:
+            agents.append(Agent(name=f"T2[m={hm:g},r={hr:g}]",
+                                kind="T2", h_m=hm, h_r=hr))
+                                
+    # Создание агентов AX
+    for hm in cfg.h_mx_values:
+        for copy in range(cfg.arb_copies):
+            agents.append(Agent(name=f"AX[m={hm:g}]#{copy + 1}",
+                                kind="AX", h_m=hm))
+                                
+    # Создание агентов AY
+    for hm in cfg.h_my_values:
+        for copy in range(cfg.arb_copies):
+            agents.append(Agent(name=f"AY[m={hm:g}]#{copy + 1}",
+                                kind="AY", h_m=hm))
+                                
     return agents
 
 
