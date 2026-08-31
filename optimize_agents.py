@@ -41,32 +41,35 @@ from opt_simulation import PARAM_NAMES, opt_config, run_pnl
 # Настройки оптимизации
 # --------------------------------------------------------------------------- #
 
-# границы поиска (исходная сетка была 0.55..1.35 — берём с запасом)
-H_M_BOUNDS = (0.001, 100.0)
-H_R_BOUNDS = (0.001, 100.0)
+# границы поиска; шкала логарифмическая (prior="log-uniform"): стартовые
+# точки сэмплируются равномерно по декадам, а GP работает в лог-координатах —
+# иначе при границах в несколько порядков почти все точки падали бы в верхнюю
+# декаду. Границы обязаны быть строго положительными.
+H_M_BOUNDS = (0.0000001, 300.0)
+H_R_BOUNDS = (0.0000001, 300.0)
 
 SPACE = [
-    Real(*H_M_BOUNDS, name="h_m1"),
-    Real(*H_R_BOUNDS, name="h_r1"),
-    Real(*H_M_BOUNDS, name="h_m2"),
-    Real(*H_R_BOUNDS, name="h_r2"),
-    Real(*H_M_BOUNDS, name="h_mx"),
-    Real(*H_M_BOUNDS, name="h_my"),
+    Real(*H_M_BOUNDS, prior="log-uniform", name="h_m1"),
+    Real(*H_R_BOUNDS, prior="log-uniform", name="h_r1"),
+    Real(*H_M_BOUNDS, prior="log-uniform", name="h_m2"),
+    Real(*H_R_BOUNDS, prior="log-uniform", name="h_r2"),
+    Real(*H_M_BOUNDS, prior="log-uniform", name="h_mx"),
+    Real(*H_M_BOUNDS, prior="log-uniform", name="h_my"),
 ]
 
-N_CALLS = 400          # всего прогонов симуляции
-N_INITIAL = 50        # из них случайных (разведка до включения GP)
+N_CALLS = 150          # всего прогонов симуляции
+N_INITIAL = 20        # из них случайных (разведка до включения GP)
 RANDOM_STATE = 1      # воспроизводимость оптимизатора
 
 PARALLEL = True       # False — чистый последовательный gp_minimize
-N_WORKERS = 20         # процессов в параллельном режиме (= размер батча)
+N_WORKERS = 12         # процессов в параллельном режиме (= размер батча)
 
 TOTAL_STEPS = 6000    # тиков в одном прогоне
 SEED: int | None = None   # seed рынка: None — новый случайный на каждый прогон
                           # (целевая функция шумная, GP это учитывает через
                           # noise="gaussian"); число — фиксированный seed,
                           # целевая функция детерминирована
-N_SEEDS = 5               # прогонов с разными сидами на одну точку, PnL
+N_SEEDS = 10               # прогонов с разными сидами на одну точку, PnL
                           # усредняется (шум падает как sqrt(N)); действует
                           # только при SEED=None
 
@@ -106,7 +109,8 @@ def evaluate(x) -> dict:
 
 
 def _fmt_params(x) -> str:
-    return "  ".join(f"{n}={v:.3f}" for n, v in zip(PARAM_NAMES, x))
+    # .4g — 4 значащих цифры: на лог-шкале важен порядок величины
+    return "  ".join(f"{n}={v:.4g}" for n, v in zip(PARAM_NAMES, x))
 
 
 def _fmt_pnl(res: dict) -> str:
@@ -140,7 +144,7 @@ class Log:
         seeds_txt = ",".join(str(s) for s in res["seeds"])
         print(f"        {_fmt_pnl(res)} ±{res['std']:.4f}  "
               f"(seeds={seeds_txt}, {res['elapsed']:.1f}s){star}")
-        self._csv.writerow([self.i] + [f"{v:.6f}" for v in x]
+        self._csv.writerow([self.i] + [f"{v:.6g}" for v in x]
                            + [f"{res['pnl'][k]:.6f}" for k in AGENT_ORDER]
                            + [f"{res['total']:.6f}", f"{res['std']:.6f}",
                               ";".join(str(s) for s in res["seeds"]),
@@ -205,7 +209,8 @@ def main() -> None:
     seed_txt = (f"случайные, {N_SEEDS} прогонов на точку (среднее PnL)"
                 if SEED is None else f"{SEED} (фиксированный, 1 прогон)")
     print(f"прогон: {TOTAL_STEPS} тиков, сиды: {seed_txt}; лог: {LOG_CSV}")
-    print(f"границы: h_m in {H_M_BOUNDS}, h_R in {H_R_BOUNDS}")
+    print(f"границы: h_m in {H_M_BOUNDS}, h_R in {H_R_BOUNDS} "
+          f"(лог-шкала)")
     print("=" * 78)
 
     log = Log(LOG_CSV)
@@ -222,7 +227,7 @@ def main() -> None:
     print(f"Готово за {elapsed / 60:.1f} мин ({log.i} прогонов)")
     print(f"Лучший суммарный PnL: {best_total:+.4f}")
     for name, value in zip(PARAM_NAMES, best_x):
-        print(f"    {name} = {value:.4f}")
+        print(f"    {name} = {value:.4g}")
     # контрольный прогон лучшей точки с печатью PnL по агентам
     res = evaluate(best_x)
     print(f"Контрольный прогон: {_fmt_pnl(res)}")
