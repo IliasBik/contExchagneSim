@@ -15,8 +15,16 @@ gp_minimize минимизирует, поэтому целевая функци
       чуть хуже. Число процессов — N_WORKERS.
 
 Шум: при SEED=None рынок каждый раз случайный, поэтому одна точка оценивается
-N_SEEDS прогонами с разными сидами и оптимизируется средний PnL; остаточный
-шум GP учитывает сам (noise="gaussian" в суррогатной модели).
+N_SEEDS прогонами с разными сидами. Оптимизируется МЕДИАНА total по сидам —
+в отличие от среднего она устойчива к тяжёлым хвостам: один сверхудачный
+прогон не вытягивает точку наверх. Остаточный шум GP учитывает сам
+(noise="gaussian" в суррогатной модели).
+
+Защита от вырожденных режимов: при экстремальных параметрах (lam агентов
+различаются на порядки) клиринг CE плохо обусловлен и цены/PnL идут вразнос —
+PnL превращается в лотерею ±1e5. Такой прогон обрывается, как только |PnL|
+агента превышает BLOWUP_LIMIT, и учитывается со штрафом -BLOWUP_PENALTY,
+поэтому GP видит в этой области стабильно плохое значение, а не лотерею.
 
 Каждая точка печатается: параметры, средний PnL каждого агента, сумма ± разброс,
 лучший результат на текущий момент. Всё также пишется в CSV (LOG_CSV).
@@ -45,8 +53,8 @@ from opt_simulation import PARAM_NAMES, opt_config, run_pnl
 # точки сэмплируются равномерно по декадам, а GP работает в лог-координатах —
 # иначе при границах в несколько порядков почти все точки падали бы в верхнюю
 # декаду. Границы обязаны быть строго положительными.
-H_M_BOUNDS = (0.0000001, 300.0)
-H_R_BOUNDS = (0.0000001, 300.0)
+H_M_BOUNDS = (0.0001, 300.0)
+H_R_BOUNDS = (0.0001, 300.0)
 
 SPACE = [
     Real(*H_M_BOUNDS, prior="log-uniform", name="h_m1"),
@@ -69,9 +77,13 @@ SEED: int | None = None   # seed рынка: None — новый случайн�
                           # (целевая функция шумная, GP это учитывает через
                           # noise="gaussian"); число — фиксированный seed,
                           # целевая функция детерминирована
-N_SEEDS = 10               # прогонов с разными сидами на одну точку, PnL
-                          # усредняется (шум падает как sqrt(N)); действует
+N_SEEDS = 10              # прогонов с разными сидами на одну точку; целевое
+                          # значение — медиана total по ним; действует
                           # только при SEED=None
+
+BLOWUP_LIMIT = 1000.0     # порог |PnL| агента (= стартовый капитал c0):
+                          # выше — симуляция пошла вразнос, прогон обрывается
+BLOWUP_PENALTY = 1000.0   # штрафной total взорвавшегося прогона (со знаком -)
 
 LOG_CSV = "opt_log.csv"
 
@@ -83,11 +95,13 @@ AGENT_ORDER = ("T1", "T2", "AX", "AY")
 # --------------------------------------------------------------------------- #
 
 def evaluate(x) -> dict:
-    """Оценка точки: N_SEEDS прогонов с разными сидами, PnL усредняется.
+    """Оценка точки: N_SEEDS прогонов, целевое значение — медиана total.
 
+    Взорвавшиеся прогоны (см. BLOWUP_LIMIT) входят в медиану со штрафом
+    -BLOWUP_PENALTY; PnL по агентам усредняется только по здоровым прогонам.
     Сиды явные и пишутся в лог/CSV, так что любой прогон воспроизводим.
     При фиксированном SEED все прогоны были бы одинаковы, поэтому делается
-    ровно один. std — разброс total по сидам (при одном прогоне 0).
+    ровно один.
     """
     if SEED is not None:
         seeds = [SEED]
@@ -95,14 +109,18 @@ def evaluate(x) -> dict:
         seeds = [int.from_bytes(os.urandom(4), "little")
                  for _ in range(N_SEEDS)]
     t0 = time.perf_counter()
-    runs = [run_pnl(x, cfg=opt_config(total_steps=TOTAL_STEPS, seed=s))
+    runs = [run_pnl(x, cfg=opt_config(total_steps=TOTAL_STEPS, seed=s),
+                    blowup_limit=BLOWUP_LIMIT)
             for s in seeds]
-    totals = [r["total"] for r in runs]
+    totals = [-BLOWUP_PENALTY if r["blown"] else r["total"] for r in runs]
+    ok = [r for r in runs if not r["blown"]]
     return {
-        "pnl": {k: float(np.mean([r["pnl"][k] for r in runs]))
+        "pnl": {k: (float(np.mean([r["pnl"][k] for r in ok])) if ok else 0.0)
                 for k in AGENT_ORDER},
-        "total": float(np.mean(totals)),
+        "total": float(np.median(totals)),   # целевое значение оптимизации
+        "mean": float(np.mean(totals)),
         "std": float(np.std(totals)),
+        "n_blown": len(runs) - len(ok),
         "seeds": seeds,
         "elapsed": time.perf_counter() - t0,
     }
@@ -115,7 +133,7 @@ def _fmt_params(x) -> str:
 
 def _fmt_pnl(res: dict) -> str:
     parts = "  ".join(f"{k}={res['pnl'][k]:+8.4f}" for k in AGENT_ORDER)
-    return f"{parts}  | total={res['total']:+9.4f}"
+    return f"{parts}  | median={res['total']:+9.4f}"
 
 
 class Log:
@@ -130,7 +148,8 @@ class Log:
         self._csv = csv.writer(self._f)
         if new:
             self._csv.writerow(("iter",) + PARAM_NAMES + AGENT_ORDER
-                               + ("total", "std", "seeds", "elapsed_s"))
+                               + ("median", "mean", "std", "n_blown",
+                                  "seeds", "elapsed_s"))
 
     def record(self, x, res: dict) -> None:
         self.i += 1
@@ -142,11 +161,15 @@ class Log:
             star = ""
         print(f"[{self.i:>3}/{N_CALLS}] {_fmt_params(x)}")
         seeds_txt = ",".join(str(s) for s in res["seeds"])
-        print(f"        {_fmt_pnl(res)} ±{res['std']:.4f}  "
+        blown_txt = (f"  ВЗОРВАЛОСЬ {res['n_blown']}/{len(res['seeds'])}"
+                     if res["n_blown"] else "")
+        print(f"        {_fmt_pnl(res)}  mean={res['mean']:+.4f} "
+              f"±{res['std']:.4f}{blown_txt}  "
               f"(seeds={seeds_txt}, {res['elapsed']:.1f}s){star}")
         self._csv.writerow([self.i] + [f"{v:.6g}" for v in x]
                            + [f"{res['pnl'][k]:.6f}" for k in AGENT_ORDER]
-                           + [f"{res['total']:.6f}", f"{res['std']:.6f}",
+                           + [f"{res['total']:.6f}", f"{res['mean']:.6f}",
+                              f"{res['std']:.6f}", res["n_blown"],
                               ";".join(str(s) for s in res["seeds"]),
                               f"{res['elapsed']:.2f}"])
         self._f.flush()
@@ -225,7 +248,7 @@ def main() -> None:
     print()
     print("=" * 78)
     print(f"Готово за {elapsed / 60:.1f} мин ({log.i} прогонов)")
-    print(f"Лучший суммарный PnL: {best_total:+.4f}")
+    print(f"Лучший суммарный PnL (медиана по сидам): {best_total:+.4f}")
     for name, value in zip(PARAM_NAMES, best_x):
         print(f"    {name} = {value:.4g}")
     # контрольный прогон лучшей точки с печатью PnL по агентам

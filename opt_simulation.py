@@ -73,14 +73,23 @@ def build_agents(params) -> list[Agent]:
 
 
 def run_pnl(params, cfg: SimConfig | None = None, verbose: bool = False,
-            return_equity: bool = False) -> dict:
+            return_equity: bool = False,
+            blowup_limit: float | None = None) -> dict:
     """Прогон симуляции с заданными параметрами агентов.
 
+    blowup_limit — защита от вырожденных режимов: если |PnL| любого агента
+    превышает порог, прогон обрывается на этом тике (при экстремальных
+    параметрах клиринг CE плохо обусловлен и цены идут вразнос — досчитывать
+    такой прогон бессмысленно). None — не проверять.
+
     Возвращает dict:
-        pnl        — {имя агента: итоговый PnL в X1}
+        pnl        — {имя агента: PnL в X1 на момент окончания}
         total      — суммарный PnL четырёх агентов
         gamma      — откалиброванная gamma
-        equity     — (4, T+1) траектории PnL (только при return_equity=True)
+        blown      — True, если прогон оборван по blowup_limit
+        end_tick   — тик, на котором прогон закончился (T или тик обрыва)
+        equity     — (4, T+1) траектории PnL (только при return_equity=True;
+                     после end_tick остаются нули)
     """
     if cfg is None:
         cfg = opt_config()
@@ -125,6 +134,8 @@ def run_pnl(params, cfg: SimConfig | None = None, verbose: bool = False,
     }
 
     # --- основной цикл (как в run_simulation, без записи) ------------------- #
+    blown = False
+    end_tick = T
     for t in range(1, T + 1):
         market.step()
         submit_translator_orders(cfg, market, ce, agents, gamma)
@@ -139,6 +150,12 @@ def run_pnl(params, cfg: SimConfig | None = None, verbose: bool = False,
             equity[i, t] = (ce.mark_to_market(a.name) if a.active
                             else equity[i, t - 1])
 
+        if (blowup_limit is not None
+                and np.abs(equity[:, t]).max() > blowup_limit):
+            blown = True
+            end_tick = t
+            break
+
         evolution_step(cfg, agents, equity, t)
 
         if verbose and cfg.progress_every and t % cfg.progress_every == 0:
@@ -146,8 +163,9 @@ def run_pnl(params, cfg: SimConfig | None = None, verbose: bool = False,
                              for i, a in enumerate(agents))
             print(f"t={t:>6}  {pnls}  total={equity[:, t].sum():+9.4f}")
 
-    pnl = {a.name: float(equity[i, T]) for i, a in enumerate(agents)}
-    out = {"pnl": pnl, "total": float(sum(pnl.values())), "gamma": gamma}
+    pnl = {a.name: float(equity[i, end_tick]) for i, a in enumerate(agents)}
+    out = {"pnl": pnl, "total": float(sum(pnl.values())), "gamma": gamma,
+           "blown": blown, "end_tick": end_tick}
     if return_equity:
         out["equity"] = equity
     return out
