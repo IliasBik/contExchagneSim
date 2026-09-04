@@ -19,6 +19,8 @@
         state = market.get_state()           # состояние обеих бирж
         result = market.quote_hedge("A", "sell", 25.0)   # оценка хеджа
         # result = {"filled": ..., "total_cost": ..., "avg_price": ...}
+        fills = market.execute_hedges("A", [("agent", "sell", 25.0)])
+        # реальное батч-исполнение хеджей (v2): съедает ликвидность стакана
 """
 
 from dataclasses import dataclass
@@ -306,14 +308,44 @@ class Exchange:
                 "avg_price": avg_price}
 
     def execute(self, side: str, size: float):
-        """Реальное исполнение заявки агента — парный интерфейс к quote.
+        """Реальное рыночное исполнение объёма size — парный интерфейс к quote.
 
-        В версии v1 агенты не влияют на рынок (хедж «на бумаге» через
-        quote), поэтому метод намеренно не реализован. При переходе к v2
-        достаточно реализовать его и заменить вызов quote -> execute.
+        Тот же проход от лучшей цены вглубь, что и в quote, но исполненный
+        объём СНИМАЕТСЯ со стакана: уровни до цены остановки гаснут целиком,
+        последний (маржинальный) уровень уменьшается pro-rata — по той же
+        конвенции, что и в аукционе. Если видимой глубины не хватает,
+        исполняется только часть; остаток заявки агента никуда не ложится
+        (это рыночная заявка, не лимитная).
+
+        Возвращает словарь того же формата, что quote:
+            filled, total_cost, avg_price.
         """
-        raise NotImplementedError(
-            "Реальная торговля агентов будет добавлена в следующей версии")
+        book = self.asks if side == "buy" else self.bids
+        levels = self._aggregate_levels(book, best_first_desc=(side == "sell"))
+
+        filled, total_cost = 0.0, 0.0
+        for price, level_volume in levels:
+            take = min(size - filled, level_volume)
+            if take <= EPS:
+                break
+            share = take / level_volume
+            for o in book:
+                if o.price == price:
+                    o.size *= (1.0 - share)
+            filled += take
+            total_cost += take * price
+            if filled >= size - EPS:
+                break
+
+        # выбрасываем полностью исполненные обезличенные заявки
+        if side == "buy":
+            self.asks = [o for o in self.asks if o.size > EPS]
+        else:
+            self.bids = [o for o in self.bids if o.size > EPS]
+
+        avg_price = total_cost / filled if filled > EPS else None
+        return {"filled": filled, "total_cost": total_cost,
+                "avg_price": avg_price}
 
 
 class CoupledMarket:
@@ -435,6 +467,55 @@ class CoupledMarket:
     def quote_hedge(self, exchange_name: str, side: str, size: float):
         """Оценка хеджа на бирже exchange_name; подробности — Exchange.quote."""
         return self.exchanges[exchange_name].quote(side, size)
+
+    def execute_hedges(self, exchange_name: str, orders):
+        """Батч-исполнение хеджей агентов на бирже exchange_name (v2).
+
+        orders — список кортежей (agent_id, side, size). Покупки и продажи
+        пулятся отдельно, взаимозачёта между агентами нет: суммарный объём
+        каждой стороны исполняется одним рыночным проходом по обезличенным
+        заявкам (Exchange.execute), а филлы возвращаются агентам pro-rata
+        размеру заявки — каждый получает одну и ту же среднюю цену стороны.
+
+        Исполненные обезличенные заявки исчезают из стакана, так что
+        bid/ask/spread/mid дальше считаются по остаточной книге, а
+        last_price обновляется средневзвешенной ценой сделок этого батча
+        (через неё хеджи попадают и в EWMA-волатильность следующего тика).
+
+        Возвращает {agent_id: {"side", "filled", "total_cost", "avg_price"}}.
+        Внутри одной стороны доля исполнения и средняя цена у всех агентов
+        ОДИНАКОВЫ (исполняется один суммарный объём, а не заявки по
+        отдельности) — «один исполнился, другой нет» невозможно. filled = 0
+        сразу у всей стороны бывает только когда встречная половина книги
+        пуста.
+        """
+        ex = self.exchanges[exchange_name]
+        results = {agent: {"side": side, "filled": 0.0, "total_cost": 0.0,
+                           "avg_price": None}
+                   for agent, side, size in orders}
+        traded_volume, traded_value = 0.0, 0.0
+
+        for side in ("buy", "sell"):
+            group = [(agent, size) for agent, s, size in orders
+                     if s == side and size > EPS]
+            total = sum(size for _, size in group)
+            if total <= EPS:
+                continue
+            fill = ex.execute(side, total)
+            if fill["filled"] <= EPS:
+                continue
+            ratio = fill["filled"] / total
+            for agent, size in group:
+                part = size * ratio
+                results[agent] = {"side": side, "filled": part,
+                                  "total_cost": part * fill["avg_price"],
+                                  "avg_price": fill["avg_price"]}
+            traded_volume += fill["filled"]
+            traded_value += fill["total_cost"]
+
+        if traded_volume > EPS:
+            ex.last_price = traded_value / traded_volume
+        return results
 
 
 if __name__ == "__main__":
