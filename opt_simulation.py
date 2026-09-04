@@ -12,7 +12,11 @@ opt_simulation.py — облегчённая симуляция для подб�
 
 Основные функции одного тика (submit_translator_orders, submit_arb_orders,
 hedge_translators, evolution_step) импортируются из agent_simulation без
-изменений — логика симуляции идентична.
+изменений — логика симуляции идентична. В частности, реальный хедж v2
+(маржинальный план по фактическому стакану F.hedge_plan + батч-исполнение
+CoupledMarket.execute_hedges, съедающее ликвидность книги) действует и здесь
+автоматически; hedge_competition в SimConfig оставлен None — при одном
+трансляторе на площадку авто-режим корректно даёт 1.
 
 Запуск демо:  python opt_simulation.py
 """

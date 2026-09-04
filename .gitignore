@@ -15,3 +15,7 @@ report/*.aux
 report/*.log
 report/*.out
 report/*.toc
+
+detail_log.jsonl
+opt_log.csv
+.vscode/
