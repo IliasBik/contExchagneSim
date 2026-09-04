@@ -13,9 +13,13 @@ agent_simulation.py — экосистема агентов поверх дву�
     2) агенты читают свои наблюдаемые величины и перевыставляют заявки на CE
        (заявка живёт ровно один клиринг: expiry = t + 1);
     3) ce.step()          — клиринг CE, филлы ложатся в балансы;
-    4) трансляторы хеджируют излишек инвентаря об домашний стакан
-       ("бумажный" хедж: quote_hedge оценивает исполнение, стакан не двигая,
-        результат заносится в балансы CE через deposit);
+    4) трансляторы хеджируют излишек инвентаря об домашний стакан — v2,
+       реальное исполнение: объём выбирается маржинальным обходом
+       остаточного стакана (F.hedge_plan, каждый агент рассчитывает на
+       1/competition объёма каждого уровня), заявки семейства пулятся по
+       сторонам и исполняются батчем (CoupledMarket.execute_hedges) —
+       филлы pro-rata по общей средней цене, исполненные обезличенные
+       заявки исчезают из книги; результат заносится в балансы CE;
     5) фиксация прибыли (mark-to-market в X1) каждого агента;
     6) эволюция: после evolution_start каждый тик деактивируется агент
        с наибольшим убытком за последние window шагов — но только если
@@ -54,6 +58,13 @@ class SimConfig:
     h_mx_values: tuple = (0.0010, )
     h_my_values: tuple = (0.0010, )
     arb_copies: int = 1
+
+    # --- реальный хедж (v2) ------------------------------------------------ #
+    # Коэффициент числа агентов при планировании хеджа: на какую долю каждого
+    # уровня книги рассчитывает один транслятор. None — авто: число живых
+    # трансляторов площадки. НЕ ЗАБЫВАТЬ: фиксированная 1.0 корректна только
+    # при одном трансляторе на биржу, иначе семейство перезапросит книгу.
+    hedge_competition: float | None = None
 
     # --- капитал и торговая мощность ------------------------------------- #
     # kappa подобраны так, чтобы обороты CE были заметны на фоне книг, а
@@ -459,49 +470,70 @@ def submit_arb_orders(cfg: SimConfig, ce: PortfolioExchange,
 def hedge_translators(cfg: SimConfig, market: CoupledMarket,
                       ce: PortfolioExchange, agents: list[Agent],
                       gamma: float, rec: Recorder, t: int) -> None:
-    """Хедж излишка инвентаря об домашний стакан (одно обращение на агента).
+    """Реальный хедж излишка инвентаря об домашний стакан (v2).
 
-    Решение принимается по наблюдаемым величинам (риск против полуспреда),
-    исполнение — единственный вызов quote_hedge; его результат заносится
-    в балансы CE двумя ногами. Потеря на хедже не проводится отдельно —
-    она сама проявляется в PnL, потому что актив скинут хуже мида.
+    Решение: маржинальный обход уровней остаточного стакана (F.hedge_plan);
+    каждый агент рассчитывает лишь на 1/competition объёма каждого уровня,
+    где competition — число живых трансляторов площадки (или фиксированное
+    значение hedge_competition из конфига). Исполнение: заявки семейства
+    пулятся по сторонам и исполняются батчем execute_hedges — филлы
+    возвращаются pro-rata по общей средней цене стороны, съеденные
+    обезличенные заявки исчезают из книги, last_price обновляется ценой
+    сделок. Результат заносится в балансы CE двумя ногами; потеря на хедже
+    отдельно не проводится — она сама проявляется в PnL, потому что актив
+    ушёл по фактическим ценам книги, а не по оценке CE.
     """
     floor = cfg.capital_floor_frac * cfg.c0
     for kind in ("T1", "T2"):
         venue, y_asset, cash_asset = F.TRANSLATOR_HOME[kind]
         exv = market.exchanges[venue]
+        members = [(i, a) for i, a in enumerate(agents)
+                   if a.kind == kind and a.active]
+        if not members:
+            continue
         mid = exv.mid
-        cost = F.hedge_cost(exv.spread, mid, cfg.tick_size)
-        if cost is None:
-            continue                      # нет встречной стороны — не хеджируем
+        if mid <= 0.0:
+            continue
+        depth = exv.depth_profile()
+        competition = (cfg.hedge_competition if cfg.hedge_competition is not None
+                       else float(len(members)))
         sigma2 = exv.volatility ** 2
-        for i, a in enumerate(agents):
-            if a.kind != kind or not a.active:
-                continue
+
+        # --- решения: каждый планирует свой объём по общему срезу книги ---- #
+        orders: list[tuple[str, str, float]] = []
+        agent_idx: dict[str, int] = {}
+        for i, a in members:
             q_units = ce.balances.get(a.name, {}).get(y_asset, 0.0)
             if abs(q_units) * mid < 1e-9:
                 continue
             cap = F.capital(ce.mark_to_market(a.name), cfg.c0)
             g = F.risk_coefficient(a.h_r, gamma, sigma2, cap, floor)
-            excess_value = F.hedge_excess_value(g, q_units * mid, cost)
-            if excess_value <= 0.0:
-                continue
-            quantity = excess_value / mid
             side = "sell" if q_units > 0 else "buy"
-            result = market.quote_hedge(venue, side, quantity)
-            filled = result["filled"]
+            levels = depth["buy"] if side == "sell" else depth["sell"]
+            plan = F.hedge_plan(g, q_units * mid, mid, levels, side,
+                                competition)
+            plan = min(plan, abs(q_units))
+            if plan <= 1e-12:
+                continue
+            orders.append((a.name, side, plan))
+            agent_idx[a.name] = i
+        if not orders:
+            continue
+
+        # --- исполнение батчем и разнос результатов по балансам ------------ #
+        results = market.execute_hedges(venue, orders)
+        for name, side, _size in orders:
+            fill = results[name]
+            filled = fill["filled"]
             if filled <= 0.0:
                 continue
             sign = -1.0 if side == "sell" else 1.0
             dq_y = sign * filled
-            dq_cash = -sign * result["total_cost"]
-            # стоимость, внесённая хеджем в портфель агента (в единицах счёта):
-            # актив ушёл по встречной стороне книги, а не по оценке CE, поэтому
-            # величина обычно отрицательна и равна потере на полуспреде
+            dq_cash = -sign * fill["total_cost"]
             value = dq_y * ce.price(y_asset) + dq_cash * ce.price(cash_asset)
-            ce.deposit(a.name, y_asset, dq_y)
-            ce.deposit(a.name, cash_asset, dq_cash)
-            rec.hedge(t, venue, i, filled * mid, value)
+            ce.deposit(name, y_asset, dq_y)
+            ce.deposit(name, cash_asset, dq_cash)
+            rec.hedge(t, venue, agent_idx[name], filled * mid, value)
 
 
 def evolution_step(cfg: SimConfig, agents: list[Agent],
@@ -515,7 +547,7 @@ def evolution_step(cfg: SimConfig, agents: list[Agent],
     (в) он не последний живой в своём типе.
     Не более одного выбытия за evolution_step тиков.
     """
-    if t <= cfg.evolution_start:
+    if t <= cfg.evolution_start or t < cfg.window:
         return None
     if t % cfg.evolution_step != 0:
         return None
