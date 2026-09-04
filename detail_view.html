@@ -138,7 +138,7 @@ kbd{font:11px monospace;border:1px solid #cfd4dc;border-radius:3px;padding:0 4px
 </section>
 
 <section>
-  <h2>Хедж трансляторов <span class="muted">коридор |q|·mid ≤ q* = cost/g: внутри — держим, снаружи — сбрасываем излишек об домашний стакан</span></h2>
+  <h2>Хедж трансляторов <span class="muted">порог |q|·mid ≤ q* = cost/g: внутри — держим; снаружи объём считается маржинальным обходом книги (hedge_plan, доля 1/competition объёма уровней) и исполняется батчем, реально съедая стакан</span></h2>
   <div class="grid g2" id="hedge"></div>
   <div class="grid g3" style="margin-top:12px">
     <div class="card"><svg id="ch-inv-T1" class="chart"></svg></div>
@@ -160,7 +160,7 @@ kbd{font:11px monospace;border:1px solid #cfd4dc;border-radius:3px;padding:0 4px
 </section>
 
 <section>
-  <h2>Стаканы лимитных бирж <span class="muted">лучшие уровни на момент тика (после аукциона); слева объём bid, справа ask; горизонтали — mid, фундаментальная, цена CE, z транслятора, средняя цена хеджа; тёмная часть столбика — объём, съеденный хеджем</span></h2>
+  <h2>Стаканы лимитных бирж <span class="muted">лучшие уровни на конец тика (остаточная книга); слева объём bid, справа ask; горизонтали — mid, фундаментальная, цена CE, z транслятора, средняя цена хеджа; полупрозрачное пунктирное продолжение столбика — объём, съеденный батчем хеджей (книга до батча)</span></h2>
   <div class="grid g2">
     <div class="card"><svg id="book1" class="book"></svg></div>
     <div class="card"><svg id="book2" class="book"></svg></div>
@@ -255,9 +255,10 @@ async function parseAll(text, name){
       const kind = meta.agents[j].kind;
       if (kind === 'T1' || kind === 'T2'){
         const e = r.world.venues[kind === 'T1' ? '1' : '2'];
-        ser.invHome[j][t] = a.inventory_units * e.mid;
-        if (e.spread != null){
-          const cost = 0.5 * Math.max(e.spread, tick) / e.mid;
+        const eh = e.before_hedge || e;   // состояние, по которому решался хедж
+        ser.invHome[j][t] = a.inventory_units * eh.mid;
+        if (eh.spread != null){
+          const cost = 0.5 * eh.spread / eh.mid;   // потеря лучшего уровня (v2)
           const g = meta.agents[j].h_r * gamma * e.volatility * e.volatility / Math.max(c0 + a.equity, floor);
           ser.qstar[j][t] = g > 0 ? cost / g : NaN;
         }
@@ -543,10 +544,13 @@ function bookChart(svg, d){
   svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
   const m = {l:62, r:10, t:40, b:10}, iw = W - m.l - m.r, ih = H - m.t - m.b;
   const bids = d.book.bids || [], asks = d.book.asks || [];
-  const prices = [...bids.map(l => l[0]), ...asks.map(l => l[0]), d.mid, d.ce, d.z, d.fund, d.hedge ? d.hedge.avg_price : NaN].filter(Number.isFinite);
+  const preB = d.preBook ? d.preBook.bids : [], preA = d.preBook ? d.preBook.asks : [];
+  const hedges = d.hedges || [];
+  const prices = [...bids.map(l => l[0]), ...asks.map(l => l[0]), ...preB.map(l => l[0]), ...preA.map(l => l[0]),
+                  d.mid, d.ce, d.z, d.fund, ...hedges.map(x => x.avg_price)].filter(Number.isFinite);
   let lo = Math.min(...prices), hi = Math.max(...prices); if (!(hi > lo)){ lo = d.mid - 1; hi = d.mid + 1; }
   const pad = (hi - lo) * 0.06; lo -= pad; hi += pad;
-  const vmax = Math.max(1e-9, ...bids.map(l => l[1]), ...asks.map(l => l[1]));
+  const vmax = Math.max(1e-9, ...bids.map(l => l[1]), ...asks.map(l => l[1]), ...preB.map(l => l[1]), ...preA.map(l => l[1]));
   const cx = m.l + iw / 2, halfw = iw / 2 - 46;
   const sy = p => m.t + (hi - p) / (hi - lo) * ih, bx = v => v / vmax * halfw;
   const bh = Math.min(11, Math.max(5, ih / ((hi - lo) / d.tick)));
@@ -558,10 +562,16 @@ function bookChart(svg, d){
     h += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${bh.toFixed(1)}" fill="${side === 'bid' ? COL.bid : COL.ask}" opacity="0.55"/>`;
     h += `<text class="ax" x="${side === 'bid' ? cx - w - 3 : cx + w + 3}" y="${(y + bh/2 + 3.5).toFixed(1)}" text-anchor="${side === 'bid' ? 'end' : 'start'}">${fmt(v, 2)}</text>`; };
   bids.forEach(l => level(l[0], l[1], 'bid')); asks.forEach(l => level(l[0], l[1], 'ask'));
-  if (d.hedge){ // съеденные хеджем уровни: sell идёт по bid, buy — по ask
-    const side = d.hedge.side === 'sell' ? 'bid' : 'ask'; let rem = d.hedge.filled;
-    for (const [p, v] of (side === 'bid' ? bids : asks)){ if (rem <= 1e-12) break; const take = Math.min(rem, v); const w = bx(take), y = sy(p) - bh / 2;
-      h += `<rect x="${(side === 'bid' ? cx - w : cx).toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${bh.toFixed(1)}" fill="${side === 'bid' ? COL.bid : COL.ask}"/>`; rem -= take; }
+  // объём, съеденный батчем хеджей: разница книги до/после, полупрозрачным
+  // продолжением остаточного столбика (реальный хедж убирает заявки из книги)
+  if (d.preBook){
+    [['bid', preB, bids], ['ask', preA, asks]].forEach(([side, pre, post]) => {
+      const postMap = new Map(post.map(l => [l[0], l[1]]));
+      pre.forEach(([p, v]) => { const left = v - (postMap.get(p) || 0); if (left <= 1e-9) return;
+        const w0 = bx(postMap.get(p) || 0), w = bx(left), y = sy(p) - bh / 2;
+        const x = side === 'bid' ? cx - w0 - w : cx + w0;
+        h += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${bh.toFixed(1)}" fill="${side === 'bid' ? COL.bid : COL.ask}" opacity="0.25" stroke="${side === 'bid' ? COL.bid : COL.ask}" stroke-dasharray="2 2"/>`; });
+    });
   }
   // горизонтали: линии рисуем сразу, подписи раскладываем так, чтобы не
   // накладывались (они обычно в паре тиков друг от друга у мида)
@@ -571,7 +581,9 @@ function bookChart(svg, d){
     labels.push({y, color, label, right}); };
   hline(d.fund, '#111827', `фундаментальная ${fmt(d.fund,3)}`, '2 3', false);
   hline(d.mid, '#111827', `mid ${fmt(d.mid,3)}`, null, false);
-  if (d.hedge) hline(d.hedge.avg_price, '#b45309', `хедж ${d.hedge.side} ${fmt(d.hedge.filled,4)} шт @ ${fmt(d.hedge.avg_price,3)}`, '6 2', false);
+  ['sell', 'buy'].forEach(s => { const hh = hedges.filter(x => x.side === s); if (!hh.length) return;
+    const total = hh.reduce((sum, x) => sum + (x.filled || 0), 0);
+    hline(hh[0].avg_price, '#b45309', `хедж ${s} ${fmt(total,4)} шт @ ${fmt(hh[0].avg_price,3)}`, '6 2', false); });
   hline(d.ce, d.ceColor, `CE ${fmt(d.ce,3)}`, '5 3', true);
   hline(d.z, d.zColor, `z ${d.zLabel} ${fmt(d.z,3)}`, '1 3', true);
   [false, true].forEach(side => {
@@ -592,11 +604,34 @@ function bookChart(svg, d){
 function rateOf(prices, w){ let s = 0; for (const [a, x] of Object.entries(w)) s += x * Math.log(prices[a]); return Math.exp(s); }
 function revalOf(prevBal, pB, pA){ let s = 0; for (const [a, q] of Object.entries(prevBal || {})) s += q * (pA[a] - pB[a]); return s; }
 
-/* Всё про хедж транслятора j на тике: коридор, решение, исполнение. */
+/* JS-зеркало F.hedge_plan: маржинальный обход уровней книги (v2). */
+function hedgePlan(g, qValue, mid, levels, side, competition){
+  const eps = 1e-12;
+  if (!(g > 0) || !(mid > 0) || !(competition > 0) || !levels) return 0;
+  let remaining = Math.abs(qValue), plan = 0;
+  for (const [price, vol] of levels){
+    const concession = side === 'sell' ? mid - price : price - mid;
+    const qStop = Math.max(concession / mid, 0) / g;
+    if (remaining <= qStop + eps) break;
+    const available = vol / competition;
+    const take = Math.min((remaining - qStop) / mid, available);
+    plan += take; remaining -= take * mid;
+    if (take < available - eps) break;
+  }
+  return plan;
+}
+
+/* Всё про хедж транслятора j на тике: порог, план по книге, исполнение.
+   Решение агент принимал ДО батча, поэтому mid/спред/книга берутся из
+   book_before_hedge, когда она записана (после батча книга уже объедена). */
 function hedgeInfo(R, Rp, j){
   const a = S.meta.agents[j], cfg = S.meta.config, v = a.kind === 'T1' ? '1' : '2', e = R.world.venues[v];
-  const yAsset = a.kind === 'T1' ? 'Y1' : 'Y2', tick = cfg.tick_size, mid = e.mid;
-  const cost = e.spread == null ? null : 0.5 * Math.max(e.spread, tick) / mid;
+  const yAsset = a.kind === 'T1' ? 'Y1' : 'Y2';
+  const pre = e.before_hedge || null;             // нет батча — книга не менялась
+  const book = pre ? pre.book : e.book;
+  const mid = pre ? pre.mid : e.mid;
+  const spread = pre ? pre.spread : e.spread;
+  const cost = spread == null ? null : 0.5 * spread / mid;   // потеря лучшего уровня
   const rec = R.agents[j], prev = Rp ? Rp.agents[j] : null;
   const qBefore = prev ? (prev.balances[yAsset] || 0) : 0;
   const fill = R.fills.find(f => f.agent === a.name), dq = fill ? (fill.quantities[yAsset] || 0) : 0;
@@ -605,10 +640,17 @@ function hedgeInfo(R, Rp, j){
   const eqClear = (prev ? prev.equity : 0) + (prev ? revalOf(prev.balances, pB, pA) : 0);
   const C = cfg.c0 + eqClear, sigma2 = e.volatility * e.volatility;
   const g = a.h_r * S.meta.gamma * sigma2 / Math.max(C, cfg.capital_floor_frac * cfg.c0);
-  const qstar = (cost != null && g > 0) ? cost / g : null;
+  const qstar = (cost != null && g > 0) ? cost / g : null;   // порог срабатывания
   const qValue = qClear * mid, excess = qstar == null ? null : Math.abs(qValue) - qstar;
+  // план по фактической книге, как в hedge_plan (доля 1/competition объёма)
+  const alive = R.agents.filter((x, i2) => S.meta.agents[i2].kind === a.kind && x.active).length;
+  const competition = cfg.hedge_competition != null ? cfg.hedge_competition : Math.max(1, alive);
+  const side = qClear > 0 ? 'sell' : 'buy';
+  const levels = side === 'sell' ? book.bids : book.asks;
+  const plan = Math.min(hedgePlan(g, qValue, mid, levels, side, competition), Math.abs(qClear));
   const hs = R.hedges.filter(h => h.agent === a.name);
-  return {a, v, e, mid, cost, g, sigma2, qstar, qBefore, qClear, qAfter, qValue, qAfterValue: qAfter * mid, excess, hs, yAsset, C, active: rec.active};
+  return {a, v, e, mid, spread, cost, g, sigma2, qstar, qBefore, qClear, qAfter, qValue,
+          qAfterValue: qAfter * mid, excess, plan, side, competition, hs, yAsset, C, active: rec.active};
 }
 
 // --------------------------------------------------------------- рендер
@@ -738,16 +780,17 @@ function renderHedge(R, Rp, x0, x1){
     let h = `<div class="card" style="border-top:3px solid ${color}"><div><b>${esc(a.name)}</b> <span class="muted small">биржа ${d.v}, нога ${d.yAsset}, кэш ${cash}</span></div>`;
     h += `<svg class="corridor"></svg>`;
     h += `<table class="kv">`;
-    h += `<tr><td>стоимость хеджа</td><td class="num">cost = ½·max(спред, тик)/mid = ${d.cost != null ? d.cost.toExponential(3) : '— (нет встречной стороны)'}</td></tr>`;
+    h += `<tr><td>потеря лучшего уровня</td><td class="num">cost = ½·спред/mid = ${d.cost != null ? d.cost.toExponential(3) : '— (нет встречной стороны)'}</td></tr>`;
     h += `<tr><td>риск</td><td class="num">g = h_R·γ·σ²/C = ${d.g.toExponential(3)} <span class="muted small">(σ²=${d.sigma2.toExponential(2)}, C после клиринга ${fmt(d.C, 2)})</span></td></tr>`;
-    h += `<tr><td>порог</td><td class="num">q* = cost/g = ${d.qstar != null ? fmt(d.qstar, 4) : '—'} ${cash} <span class="muted small">(${d.qstar != null ? fmt(d.qstar / d.mid, 5) : '—'} шт)</span></td></tr>`;
+    h += `<tr><td>порог срабатывания</td><td class="num">q* = cost/g = ${d.qstar != null ? fmt(d.qstar, 4) : '—'} ${cash} <span class="muted small">(${d.qstar != null ? fmt(d.qstar / d.mid, 5) : '—'} шт)</span></td></tr>`;
     h += `<tr><td>позиция</td><td class="num">до клиринга ${sgn(d.qBefore)} → после ${sgn(d.qClear)} шт = ${sgn(d.qValue, 4)} ${cash}</td></tr>`;
-    if (d.excess != null) h += `<tr><td>излишек</td><td class="num">|q|·mid − q* = <b class="${d.excess > 0 ? 'neg' : 'pos'}">${sgn(d.excess, 4)}</b> → ${d.excess > 0 ? `сбросить ${fmt(d.excess / d.mid, 5)} шт (${d.qClear > 0 ? 'продажа' : 'покупка'})` : 'хедж не нужен'}</td></tr>`;
+    if (d.excess != null) h += `<tr><td>сигнал</td><td class="num">|q|·mid − q* = <b class="${d.excess > 0 ? 'neg' : 'pos'}">${sgn(d.excess, 4)}</b> → ${d.excess > 0 ? 'хеджирует' : 'хедж не нужен'}</td></tr>`;
+    if (d.plan > 1e-12) h += `<tr><td>план по книге</td><td class="num">${d.qClear > 0 ? 'продажа' : 'покупка'} ${fmt(d.plan, 5)} шт <span class="muted small">(hedge_plan: обход уровней до q_stop, доля 1/${fmt(d.competition, 0)} объёма каждого уровня)</span></td></tr>`;
     if (d.hs.length) d.hs.forEach(x => {
       const slip = x.side === 'sell' ? d.mid - x.avg_price : x.avg_price - d.mid;
-      h += `<tr><td>исполнено</td><td class="num">${x.side === 'sell' ? 'продажа' : 'покупка'} ${fmt(x.filled, 5)} из ${fmt(x.requested, 5)} шт @ ${fmt(x.avg_price, 3)} <span class="muted small">(mid ${fmt(d.mid, 3)}, проскальзывание ${fmt(slip, 3)} = ${d.e.spread ? fmt(slip / d.e.spread * 2, 2) : '—'} полуспреда)</span></td></tr>`;
+      h += `<tr><td>исполнено</td><td class="num">${x.side === 'sell' ? 'продажа' : 'покупка'} ${fmt(x.filled, 5)} из ${fmt(x.requested, 5)} шт @ ${fmt(x.avg_price, 3)} <span class="muted small">(средняя цена стороны батча; mid до хеджа ${fmt(d.mid, 3)}, проскальзывание ${fmt(slip, 3)} = ${d.spread ? fmt(slip / d.spread * 2, 2) : '—'} полуспреда)</span></td></tr>`;
       h += `<tr><td>результат</td><td class="num">позиция после хеджа ${sgn(d.qAfter)} шт; вклад в PnL <b class="${cls(x.value)}">${sgn(x.value)}</b> X1; всего на хеджах ${sgn(ser.hedgeCum[j][S.t])} X1</td></tr>`; });
-    else if (d.excess != null && d.excess > 0 && d.active) h += `<tr><td>исполнено</td><td class="neg">хедж требовался, но не исполнен (стакан пуст на нужной стороне)</td></tr>`;
+    else if (d.plan > 1e-12 && d.active) h += `<tr><td>исполнено</td><td class="neg">план был, но батч не исполнился (встречная сторона книги пуста)</td></tr>`;
     h += `</table></div>`; html += h;
   });
   $('#hedge').innerHTML = html;
@@ -784,9 +827,9 @@ function renderBooks(R){
   const cfg = S.meta.config, p = R.ce.prices;
   [['1', 'T1', p.Y1, COL.ce1, '#book1'], ['2', 'T2', p.Y2 / p.X2, COL.ce2, '#book2']].forEach(([v, kind, ce, ceColor, sel]) => {
     const e = R.world.venues[v], tr = S.meta.agents.find(a => a.kind === kind), o = tr ? R.orders.find(x => x.agent === tr.name) : null;
-    const hedge = R.hedges.find(h => h.venue === v) || null;
-    bookChart($(sel), {book:e.book, mid:e.mid, fund:R.world.fundamental, ce, ceColor, z: o ? o.z : NaN, zColor:COL[kind], zLabel:kind,
-      hedge, tick:cfg.tick_size, title:`биржа ${v}: спред ${fmt(e.spread, 2)}, глубина у мида ${fmt(e.depth, 1)}, уровней ${e.book.bids.length}+${e.book.asks.length}`});
+    const hedges = R.hedges.filter(h => h.venue === v);
+    bookChart($(sel), {book:e.book, preBook:e.before_hedge ? e.before_hedge.book : null, mid:e.mid, fund:R.world.fundamental, ce, ceColor, z: o ? o.z : NaN, zColor:COL[kind], zLabel:kind,
+      hedges, tick:cfg.tick_size, title:`биржа ${v}: спред ${fmt(e.spread, 2)}, глубина у мида ${fmt(e.depth, 1)}, уровней ${e.book.bids.length}+${e.book.asks.length}${hedges.length ? ' · хедж съел часть книги' : ''}`});
   });
 }
 

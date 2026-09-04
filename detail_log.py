@@ -13,7 +13,10 @@ detail_log.py — детальный потиковый журнал прого�
     world   — фундаментальная цена, якорь и состояние обеих лимитных бирж:
               mid, last, best bid/ask, спред, глубина у мида, EWMA-vol,
               объём последнего аукциона, схема стакана (BOOK_LEVELS лучших
-              ценовых уровней на сторону: [[цена, объём], ...])
+              ценовых уровней на сторону: [[цена, объём], ...]) на конец
+              тика; на тиках с хеджами дополнительно before_hedge — mid,
+              last, спред, best bid/ask и схема стакана ДО батча хеджей
+              (реальный хедж съедает книгу и двигает last_price)
     ce      — цены CE после клиринга и итоги клиринга: оборот, ранг книги,
               невязка, итерации кап-обрезки, чистые потоки стоимости и
               количества по активам
@@ -22,13 +25,15 @@ detail_log.py — детальный потиковый журнал прого�
               величины на момент подачи (mid, H, capital, g, инвентарь...)
     fills   — филлы клиринга: oid (сшивается с orders), f, нотионал,
               количества по каждой ноге
-    hedges  — хеджи об домашний стакан: сторона, запрошено/исполнено,
-              средняя цена, стоимость исполнения, вклад в PnL
-    agents  — состояние каждого агента ПОСЛЕ тика: балансы по всем активам,
-              equity (PnL в X1), капитал, инвентарь торгуемой ноги, жив/мёртв
+    hedges  — хеджи об домашний стакан (v2 — батч execute_hedges, филлы
+              pro-rata по средней цене стороны): сторона, запрошено/
+              исполнено, средняя цена, стоимость исполнения, вклад в PnL
 
 Подключение не требует правки логики симуляции: attach() оборачивает
-ce.submit, market.quote_hedge и rec.hedge и снимает копию событий по пути.
+ce.submit, market.execute_hedges (и quote_hedge для v1) и rec.hedge
+и снимает копию событий по пути.
+    agents  — состояние каждого агента ПОСЛЕ тика: балансы по всем активам,
+              equity (PnL в X1), капитал, инвентарь торгуемой ноги, жив/мёртв
 
 Пример обработки:
 
@@ -55,7 +60,7 @@ import numpy as np
 import agent_formulas as F
 
 VENUES = ("1", "2")
-BOOK_LEVELS = 15     # сколько лучших ценовых уровней стакана писать на сторону
+BOOK_LEVELS = 20     # сколько лучших ценовых уровней стакана писать на сторону
 
 
 def _book_levels(orders, best_first_desc: bool, limit: int = BOOK_LEVELS):
@@ -86,7 +91,9 @@ class DetailLog:
         self._kind = {a.name: a.kind for a in agents}
         self._orders: list[dict] = []   # заявки, поданные с прошлой записи
         self._hedges: list[dict] = []   # хеджи с прошлой записи
-        self._last_quote: dict | None = None
+        self._last_quote: dict | None = None   # v1: одиночный quote_hedge
+        self._batch: dict = {}          # v2: результаты execute_hedges по именам
+        self._pre_books: dict = {}      # книга каждой площадки ДО батча хеджей
         self._write({
             "type": "meta",
             "assets": list(F.ASSETS),
@@ -100,7 +107,7 @@ class DetailLog:
     # ------------------------------------------------------------- перехват
 
     def attach(self, ce, market, rec, agents: list) -> None:
-        """Обернуть ce.submit / market.quote_hedge / rec.hedge.
+        """Обернуть ce.submit / market.execute_hedges (v1: quote_hedge) / rec.hedge.
 
         Симуляция вызывает их как раньше; журнал перехватывает события,
         не меняя ни аргументов, ни результатов.
@@ -134,13 +141,40 @@ class DetailLog:
 
         market.quote_hedge = quote_hedge
 
-        # rec.hedge вызывается сразу после quote_hedge (один хедж на агента
-        # за тик), поэтому пара «котировка + учёт» сшивается порядком вызовов
+        # v2: батч-исполнение хеджей — запоминаем результат по каждому агенту
+        # и книгу площадки ДО батча (после него она уже объедена)
+        if hasattr(market, "execute_hedges"):
+            orig_batch = market.execute_hedges
+
+            def execute_hedges(venue, orders):
+                ex = market.exchanges[venue]
+                # состояние площадки, по которому агенты принимали решение:
+                # батч съедает книгу и двигает last_price (а с ним и mid при
+                # пустой стороне), поэтому конца тика недостаточно
+                self._pre_books[venue] = {
+                    "mid": ex.mid,
+                    "last_price": ex.last_price,
+                    "spread": ex.spread,
+                    "best_bid": ex.best_bid,
+                    "best_ask": ex.best_ask,
+                    "book": {"bids": _book_levels(ex.bids, best_first_desc=True),
+                             "asks": _book_levels(ex.asks, best_first_desc=False)}}
+                res = orig_batch(venue, orders)
+                for agent, side, size in orders:
+                    self._batch[agent] = {"side": side, "requested": size,
+                                          **(res.get(agent) or {})}
+                return res
+
+            market.execute_hedges = execute_hedges
+
+        # rec.hedge вызывается после исполнения; детали берём из батча по
+        # имени агента (v2), иначе — из последнего quote_hedge (v1)
         orig_hedge = rec.hedge
 
         def hedge(t, venue, agent_idx, notional, result_value):
             orig_hedge(t, venue, agent_idx, notional, result_value)
-            q = self._last_quote or {}
+            q = self._batch.pop(agents[agent_idx].name, None) \
+                or self._last_quote or {}
             self._hedges.append({
                 "agent": agents[agent_idx].name,
                 "venue": venue,
@@ -173,11 +207,14 @@ class DetailLog:
                 "depth": ex.depth_near_mid(self._cfg.depth_band),
                 "volatility": ex.volatility,
                 "auction_volume": ex.last_trade_volume,
-                # схема стакана: лучшие уровни от мида вглубь; хедж «бумажный»,
-                # так что это ровно та книга, по которой он оценивался
+                # схема стакана НА КОНЕЦ тика: после реальных хеджей это
+                # остаточная книга; состояние до батча — book_before_hedge
                 "book": {"bids": _book_levels(ex.bids, best_first_desc=True),
                          "asks": _book_levels(ex.asks, best_first_desc=False)},
             }
+            pre = self._pre_books.pop(name, None)
+            if pre is not None:
+                venues[name]["before_hedge"] = pre
 
         ce_rec: dict = {"prices": ce.prices()}
         fills: list[dict] = []
