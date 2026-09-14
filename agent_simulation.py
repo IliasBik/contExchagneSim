@@ -111,11 +111,11 @@ class SimConfig:
     # цен блуждает как sigma_F * sqrt(T) (1e-3 -> ~11% за 12000 тиков)
     fundamental_vol: float = 1e-3
     venue1: ExchangeConfig = field(default_factory=lambda: ExchangeConfig(
-        name="1", arrival_rate=10.0, order_size=1.0, order_ttl=5,
-        price_std=3.0, ewma_half_life=10.0))
+        name="1", arrival_rate=10.0, order_size=1.0, order_ttl=80,
+        price_std=10.0, ewma_half_life=10.0))
     venue2: ExchangeConfig = field(default_factory=lambda: ExchangeConfig(
-        name="2", arrival_rate=3.0, order_size=1.0, order_ttl=5,
-        price_std=3.0, ewma_half_life=10.0))
+        name="2", arrival_rate=3.0, order_size=1.0, order_ttl=80,
+        price_std=10.0, ewma_half_life=10.0))
 
     progress_every: int = 500    # период печати прогресса (0 — молча)
 
