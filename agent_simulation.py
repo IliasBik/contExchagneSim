@@ -110,11 +110,17 @@ class SimConfig:
     # волатильность фундаментальной цены: лог-шок якоря за тик; уровень
     # цен блуждает как sigma_F * sqrt(T) (1e-3 -> ~11% за 12000 тиков)
     fundamental_vol: float = 1e-3
+    # order_size: одна фоновая заявка = 0.05 шт ~ 5 X1 при цене 100, то есть
+    # ровно калиброванный хедж-порог q_max_fraction * c0. При order_size=1 уровень
+    # книги (100 X1) был на два порядка больше типичного хеджа агентов, и глубина
+    # стакана никогда не ограничивала их оборот. Цены/спреды от размера не
+    # зависят (число заявок то же), масштабируется только объём: H, lambda
+    # трансляторов и вместе с ними оптимальные h_m (примерно линейно).
     venue1: ExchangeConfig = field(default_factory=lambda: ExchangeConfig(
-        name="1", arrival_rate=10.0, order_size=1.0, order_ttl=80,
+        name="1", arrival_rate=10.0, order_size=0.05, order_ttl=80,
         price_std=10.0, ewma_half_life=10.0))
     venue2: ExchangeConfig = field(default_factory=lambda: ExchangeConfig(
-        name="2", arrival_rate=3.0, order_size=1.0, order_ttl=80,
+        name="2", arrival_rate=3.0, order_size=0.05, order_ttl=80,
         price_std=10.0, ewma_half_life=10.0))
 
     progress_every: int = 500    # период печати прогресса (0 — молча)
