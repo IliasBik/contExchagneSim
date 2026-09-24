@@ -80,8 +80,27 @@ class SimConfig:
     q_max_fraction: float = 0.005  # хедж-порог как доля капитала (калибровка)
     capital_floor_frac: float = 0.01  # пол капитала в g, доля C0
     shading_clamp: float = 1.0    # предохранитель |g*q| в экспоненте
-    arb_shading: bool = True      # шейдинг котировки арбитражёров
+    # Шейдинг котировки арбитражёров. По умолчанию выключен: их портфель
+    # (+X1/-X2, +Y1/-Y2) самохеджирован, двигать котировку против инвентаря
+    # незачем; с шейдингом при большом инвентаре котировка уходит в клэмп и
+    # цены CE отрываются от справедливых (mean_field.md, разделы 8, 11, 12).
+    arb_shading: bool = False
     arb_vol_half_life: float = 20.0  # полураспад EWMA-волатильности базиса
+    # sigma^2 в риск-коэффициенте арбитражёров (см. mean_field.md, разделы 8, 11):
+    #   "venues"   — константа из волатильности бирж после прогрева (как gamma);
+    #   "ce_basis" — EWMA собственного базиса на CE: его двигают их же котировки,
+    #                положительная обратная связь уводит шейдинг в клэмп.
+    arb_vol: str = "venues"
+
+    # --- учёт результата -------------------------------------------------- #
+    # Цены оценки позиций (класс Marks) — PnL агентов в run_simulation (отбор,
+    # отчёт) и в run_pnl (целевая функция оптимизации):
+    #   "fair" — цены закрытия позиции: X1 = X2 = 1, Y_v = мид биржи v;
+    #   "ce"   — цены CE; их задают сами агенты, при большом инвентаре
+    #            арбитражёров они отрываются от справедливых (P_X2 -> 0.37).
+    # Разложение PnL в Recorder точное при любом выборе: сделка на CE по
+    # ценам, отличным от цен оценки, учитывается отдельным членом.
+    marks: str = "fair"
 
     # --- эволюционный отбор ------------------------------------------------#
     total_steps: int = 12000
@@ -148,6 +167,60 @@ class EwmaVar:
         self._prev = level
 
 
+class ConstVar:
+    """Постоянная дисперсия: замена EwmaVar при arb_vol="venues"."""
+
+    def __init__(self, var: float):
+        self.var = var
+
+    def update(self, level: float) -> None:
+        pass
+
+
+def make_basis_vol(cfg: SimConfig, ce, ex1, ex2) -> dict:
+    """Оценка дисперсии базиса для шейдинга арбитражёров согласно cfg.arb_vol."""
+    if cfg.arb_vol == "venues":
+        var = float(np.mean([ex1.volatility ** 2, ex2.volatility ** 2]))
+        return {kind: ConstVar(var) for kind in ("AX", "AY")}
+    if cfg.arb_vol == "ce_basis":
+        return {kind: EwmaVar(cfg.arb_vol_half_life, ce.rate(F.PORTFOLIOS[kind]))
+                for kind in ("AX", "AY")}
+    raise ValueError(f"arb_vol: {cfg.arb_vol!r}")
+
+
+class Marks:
+    """Цены оценки позиций для учёта результата (SimConfig.marks).
+
+    "fair" — цены закрытия: X1 = X2 = 1, Y_v = мид лимитной биржи v;
+    "ce"   — текущие цены CE (то же, что ce.mark_to_market).
+    prices() — вектор в порядке F.ASSETS, value(agent) — стоимость портфеля
+    агента в X1. Цены читаются в момент вызова: мид меняется в market.step()
+    и при исполнении хеджа, цены CE — в клиринге.
+    """
+
+    def __init__(self, mode: str, ce, ex1, ex2):
+        if mode not in ("fair", "ce"):
+            raise ValueError(f"marks: {mode!r}")
+        self.mode = mode
+        self._ce, self._ex1, self._ex2 = ce, ex1, ex2
+
+    def price(self, asset: str) -> float:
+        if self.mode == "ce":
+            return self._ce.price(asset)
+        if asset == "Y1":
+            return self._ex1.mid
+        if asset == "Y2":
+            return self._ex2.mid
+        return 1.0
+
+    def prices(self) -> np.ndarray:
+        return np.array([self.price(a) for a in F.ASSETS])
+
+    def value(self, agent: str) -> float:
+        bal = self._ce.balances.get(agent, {})
+        return sum(q * self.price(a) for a, q in bal.items())
+
+
 # --------------------------------------------------------------------------- #
 # Запись прогона
 # --------------------------------------------------------------------------- #
@@ -169,26 +242,30 @@ class Recorder:
     CE       — оборот за тик всего и в разрезе типов агентов, число активных
                заявок, ранг книги, невязка клиринга, среднее |f| по типам.
 
-    АГЕНТЫ   — оборот каждого агента, и разложение его PnL на две компоненты.
-               Разложение точное, а не оценочное: внутри тика цены CE меняются
-               ровно один раз (в ce.step), поэтому
+    АГЕНТЫ   — оборот каждого агента, и разложение его PnL на три компоненты.
+               PnL — стоимость портфеля по ценам оценки P (Marks: справедливые
+               цены или цены CE, см. SimConfig.marks). Внутри тика количества
+               меняются дважды — в клиринге CE и затем в хедже, — поэтому точно
 
                    dPnL = sum_a q_prev[a] * (P_new[a] - P_old[a])   переоценка
-                        + sum_a dq_сделки[a] * P_new[a]             = 0
+                        + sum_a dq_сделки[a] * P_new[a]             исполнение
                         + sum_a dq_хедж[a]   * P_new[a]             хедж
 
-               Средний член равен нулю тождественно: портфель заявки
-               самофинансируем (sum w = 0), поэтому сделка на CE не создаёт
-               и не уничтожает стоимость в момент исполнения. Весь PnL
-               транслятора — это переоценка накопленной позиции плюс то,
-               что он потерял (или выиграл) на хедже об домашний стакан.
-               Невязка этого тождества пишется в pnl_residual и служит
-               проверкой корректности (должна быть машинным нулём).
+               Исполнение — выигрыш на сделке CE относительно цен оценки.
+               При marks="ce" член тождественно нулевой: портфель заявки
+               самофинансируем (sum w = 0), а цены CE и есть цены оценки.
+               При marks="fair" это захваченная доля расхождения цен CE со
+               справедливыми. Хедж — то, что транслятор потерял (или выиграл)
+               об домашний стакан относительно тех же цен оценки.
+               Невязка тождества пишется в pnl_residual и служит проверкой
+               корректности (должна быть машинным нулём).
     """
 
-    def __init__(self, cfg: SimConfig, agents: list, ce: PortfolioExchange):
+    def __init__(self, cfg: SimConfig, agents: list, ce: PortfolioExchange,
+                 marks: Marks | None = None):
         n, T = len(agents), cfg.total_steps
         self.cfg = cfg
+        self.marks = marks if marks is not None else Marks("ce", ce, None, None)
         self.n_assets = len(F.ASSETS)
         self._idx = {a.name: i for i, a in enumerate(agents)}
         self._kind_idx = {k: j for j, k in enumerate(KINDS)}
@@ -197,6 +274,7 @@ class Recorder:
         # --- агенты ---------------------------------------------------------#
         self.turnover = np.zeros((n, T + 1), np.float32)   # |нотионал| на CE
         self.reval = np.zeros((n, T + 1), np.float32)      # переоценка позиции
+        self.ce_exec = np.zeros((n, T + 1), np.float32)    # исполнение на CE
         self.hedge_pnl = np.zeros((n, T + 1), np.float32)  # результат хеджа
         self.pnl_residual = np.zeros(T + 1)                # контроль тождества
 
@@ -232,9 +310,11 @@ class Recorder:
         self._book_bid: list[np.ndarray] = []
         self._book_ask: list[np.ndarray] = []
 
-        # состояние для разложения PnL: количества и цены до клиринга
+        # состояние для разложения PnL: количества до клиринга и после него
+        # (до хеджа), цены оценки на конец прошлого тика
         self._q_prev = np.zeros((n, self.n_assets))
-        self._p_prev = np.array([ce.price(a) for a in F.ASSETS])
+        self._q_mid = np.zeros((n, self.n_assets))
+        self._p_prev = self.marks.prices()
         self.stats = {"hedge_count": 0, "hedge_value": 0.0}
 
     # ------------------------------------------------------------------ мир
@@ -279,16 +359,22 @@ class Recorder:
 
     # ------------------------------------------------------------------- CE
 
-    def before_clearing(self, ce: PortfolioExchange, agents: list) -> None:
-        """Количества и цены до клиринга — база для разложения PnL."""
-        self._p_prev = np.array([ce.price(a) for a in F.ASSETS])
+    def _snapshot(self, ce: PortfolioExchange, agents: list,
+                  out: np.ndarray) -> None:
         for i, a in enumerate(agents):
             bal = ce.balances.get(a.name, {})
             for j, asset in enumerate(F.ASSETS):
-                self._q_prev[i, j] = bal.get(asset, 0.0)
+                out[i, j] = bal.get(asset, 0.0)
 
-    def clearing(self, t: int, report) -> None:
-        """Итоги клиринга: оборот всего, по агентам и по типам."""
+    def before_clearing(self, ce: PortfolioExchange, agents: list) -> None:
+        """Количества до клиринга — база для разложения PnL."""
+        self._snapshot(ce, agents, self._q_prev)
+
+    def clearing(self, t: int, report, ce: PortfolioExchange,
+                 agents: list) -> None:
+        """Итоги клиринга: оборот всего, по агентам и по типам; количества
+        после клиринга (до хеджа) — для члена «исполнение»."""
+        self._snapshot(ce, agents, self._q_mid)
         self.ce_gross[t] = report.gross_notional
         self.ce_orders[t] = len(report.fills)
         self.ce_rank[t] = report.rank
@@ -319,14 +405,17 @@ class Recorder:
 
     def after_tick(self, t: int, ce: PortfolioExchange, agents: list,
                    equity: np.ndarray) -> None:
-        """Переоценка позиций и проверка тождества разложения PnL."""
-        p_new = np.array([ce.price(a) for a in F.ASSETS])
+        """Переоценка, исполнение на CE и проверка тождества разложения PnL."""
+        p_new = self.marks.prices()
         alive = np.array([a.active for a in agents], dtype=bool)
         self.reval[:, t] = np.where(
             alive, self._q_prev @ (p_new - self._p_prev), 0.0)
+        self.ce_exec[:, t] = np.where(
+            alive, (self._q_mid - self._q_prev) @ p_new, 0.0)
         delta = equity[:, t] - equity[:, t - 1]
-        parts = self.reval[:, t] + self.hedge_pnl[:, t]
+        parts = self.reval[:, t] + self.ce_exec[:, t] + self.hedge_pnl[:, t]
         self.pnl_residual[t] = float(np.max(np.abs(delta - parts)))
+        self._p_prev = p_new
 
     # ----------------------------------------------------------------- сборка
 
@@ -453,7 +542,8 @@ def submit_arb_orders(cfg: SimConfig, ce: PortfolioExchange,
 
 def hedge_translators(cfg: SimConfig, market: CoupledMarket,
                       ce: PortfolioExchange, agents: list[Agent],
-                      gamma: float, rec: Recorder, t: int) -> None:
+                      gamma: float, rec: Recorder, t: int,
+                      marks: Marks | None = None) -> None:
     """Реальный хедж излишка инвентаря об домашний стакан (v2).
 
     Решение: маржинальный обход уровней остаточного стакана (F.hedge_plan);
@@ -465,7 +555,9 @@ def hedge_translators(cfg: SimConfig, market: CoupledMarket,
     обезличенные заявки исчезают из книги, last_price обновляется ценой
     сделок. Результат заносится в балансы CE двумя ногами; потеря на хедже
     отдельно не проводится — она сама проявляется в PnL, потому что актив
-    ушёл по фактическим ценам книги, а не по оценке CE.
+    ушёл по фактическим ценам книги, а не по ценам оценки (marks; None —
+    цены CE). Для записи rec.hedge результат хеджа считается по тем же ценам
+    оценки, что и PnL, — иначе разложение в Recorder не сойдётся.
     """
     floor = cfg.capital_floor_frac * cfg.c0
     for kind in ("T1", "T2"):
@@ -506,6 +598,7 @@ def hedge_translators(cfg: SimConfig, market: CoupledMarket,
 
         # --- исполнение батчем и разнос результатов по балансам ------------ #
         results = market.execute_hedges(venue, orders)
+        price = marks.price if marks is not None else ce.price
         for name, side, _size in orders:
             fill = results[name]
             filled = fill["filled"]
@@ -514,7 +607,7 @@ def hedge_translators(cfg: SimConfig, market: CoupledMarket,
             sign = -1.0 if side == "sell" else 1.0
             dq_y = sign * filled
             dq_cash = -sign * fill["total_cost"]
-            value = dq_y * ce.price(y_asset) + dq_cash * ce.price(cash_asset)
+            value = dq_y * price(y_asset) + dq_cash * price(cash_asset)
             ce.deposit(name, y_asset, dq_y)
             ce.deposit(name, cash_asset, dq_cash)
             rec.hedge(t, venue, agent_idx[name], filled * mid, value)
@@ -618,15 +711,13 @@ def run_simulation(cfg: SimConfig, verbose: bool = True) -> SimResult:
     ce_prices[0] = [ce.price(asset) for asset in F.ASSETS]
     mids[0] = (ex1.mid, ex2.mid)
     deaths: list[tuple] = []
-    rec = Recorder(cfg, agents, ce)
+    marks = Marks(cfg.marks, ce, ex1, ex2)
+    rec = Recorder(cfg, agents, ce, marks)
     rec.market(0, market)
     stats = rec.stats
 
-    # волатильность базисов для шейдинга арбитражёров (оценка по ценам CE)
-    basis_vol = {
-        kind: EwmaVar(cfg.arb_vol_half_life, ce.rate(F.PORTFOLIOS[kind]))
-        for kind in ("AX", "AY")
-    }
+    # дисперсия базисов для шейдинга арбитражёров (см. SimConfig.arb_vol)
+    basis_vol = make_basis_vol(cfg, ce, ex1, ex2)
 
     if verbose:
         _print_startup(cfg, gamma, ex1, ex2)
@@ -639,8 +730,8 @@ def run_simulation(cfg: SimConfig, verbose: bool = True) -> SimResult:
         submit_arb_orders(cfg, ce, agents, gamma, basis_vol)
         rec.before_clearing(ce, agents)
         report = ce.step(dt=1.0)
-        rec.clearing(t, report)
-        hedge_translators(cfg, market, ce, agents, gamma, rec, t)
+        rec.clearing(t, report, ce, agents)
+        hedge_translators(cfg, market, ce, agents, gamma, rec, t, marks)
 
         for kind in ("AX", "AY"):
             basis_vol[kind].update(ce.rate(F.PORTFOLIOS[kind]))
@@ -650,11 +741,11 @@ def run_simulation(cfg: SimConfig, verbose: bool = True) -> SimResult:
                 equity[i, t] = equity[i, t - 1]
                 inventory[i, t] = inventory[i, t - 1]
                 continue
-            equity[i, t] = ce.mark_to_market(a.name)
+            equity[i, t] = marks.value(a.name)
             leg = (F.TRANSLATOR_HOME[a.kind][1] if a.kind in F.TRANSLATOR_HOME
                    else F.ARB_LONG_LEG[a.kind])
             inventory[i, t] = (ce.balances.get(a.name, {}).get(leg, 0.0)
-                               * ce.price(leg))
+                               * marks.price(leg))
         ce_prices[t] = [ce.price(asset) for asset in F.ASSETS]
         mids[t] = (ex1.mid, ex2.mid)
         gross[t] = report.gross_notional
@@ -698,6 +789,8 @@ def _print_startup(cfg: SimConfig, gamma: float, ex1, ex2) -> None:
           f"{cfg.kappa_a * cfg.c0:.2f}   хедж-порог: "
           f"{cfg.q_max_fraction * cfg.c0:.0f} X1 "
           f"(~{cfg.q_max_fraction * cfg.c0 / ex1.mid:.2f} шт Y)")
+    print(f"  учёт: цены оценки {cfg.marks!r}; арбитражёры: шейдинг "
+          f"{'вкл' if cfg.arb_shading else 'выкл'}, sigma^2 {cfg.arb_vol!r}")
     print("=" * 78)
 
 

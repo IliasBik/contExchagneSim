@@ -71,6 +71,7 @@ class RunData:
     inventory: np.ndarray         # стоимость позиции по торгуемой ноге, X1
     turnover: np.ndarray          # |нотионал| сделок на CE за тик, X1
     reval: np.ndarray             # компонента PnL: переоценка позиции
+    ce_exec: np.ndarray           # компонента PnL: исполнение на CE против цен оценки
     hedge_pnl: np.ndarray         # компонента PnL: результат хеджа
 
     # --- мир, (T+1,) и (T+1, 2) -------------------------------------------- #
@@ -202,7 +203,7 @@ def build(cfg: A.SimConfig, verbose: bool = True) -> RunData:
                 for t, name, loss in res.deaths],
         elapsed=time.time() - t0,
         equity=res.equity, inventory=res.inventory, turnover=rec.turnover,
-        reval=rec.reval, hedge_pnl=rec.hedge_pnl,
+        reval=rec.reval, ce_exec=rec.ce_exec, hedge_pnl=rec.hedge_pnl,
         fundamental=rec.fundamental, anchor=rec.anchor, mid=rec.mid,
         last_price=rec.last_price, best_bid=rec.best_bid,
         best_ask=rec.best_ask, spread=rec.spread, depth=rec.depth,
@@ -418,6 +419,7 @@ def summary(run: RunData) -> dict:
             "pnl_stationary": float(phase_pnl(run, ph.stationary)[rows].sum()),
             "turnover": float(run.turnover[rows].sum()),
             "reval": float(run.reval[rows].sum()),
+            "exec": float(run.ce_exec[rows].sum()),
             "hedge": float(run.hedge_pnl[rows].sum()),
             "inventory_abs": float(np.abs(run.inventory[rows]).mean()),
         }
@@ -452,4 +454,5 @@ if __name__ == "__main__":
     for kind in KINDS:
         k = s["kinds"][kind]
         print(f"  {kind}: живых {k['alive']}/{k['n']}, PnL {k['pnl_total']:+.3f}, "
-              f"переоценка {k['reval']:+.3f}, хедж {k['hedge']:+.3f}")
+              f"переоценка {k['reval']:+.3f}, исполнение CE {k['exec']:+.3f}, "
+              f"хедж {k['hedge']:+.3f}")

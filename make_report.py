@@ -99,11 +99,12 @@ def print_summary(run: D.RunData) -> None:
           f"оборот CE {s['ce']['gross_mean']:.4f} X1/тик, "
           f"хеджей {int(s['world']['1']['hedge_count'] + s['world']['2']['hedge_count'])}")
     print(f"{'семейство':<10}{'живых':>8}{'PnL':>12}{'переоценка':>14}"
-          f"{'хедж':>12}{'оборот':>12}")
+          f"{'исполн. CE':>14}{'хедж':>12}{'оборот':>12}")
     for kind in D.KINDS:
         k = s["kinds"][kind]
         print(f"{kind:<10}{k['alive']:>4}/{k['n']:<3}{k['pnl_total']:>+12.4f}"
-              f"{k['reval']:>+14.4f}{k['hedge']:>+12.4f}{k['turnover']:>12.1f}")
+              f"{k['reval']:>+14.4f}{k['exec']:>+14.4f}{k['hedge']:>+12.4f}"
+              f"{k['turnover']:>12.1f}")
     print(f"Невязки: клиринг {s['ce']['imbalance_max']:.1e}, "
           f"разложение PnL {s['ce']['pnl_residual_max']:.1e} X1")
     print("=" * 78)

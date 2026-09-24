@@ -30,10 +30,11 @@ from coupled_market import CoupledMarket
 from pfx_exchange import Exchange as PortfolioExchange
 from agent_simulation import (
     Agent,
-    EwmaVar,
+    Marks,
     SimConfig,
     evolution_step,
     hedge_translators,
+    make_basis_vol,
     submit_arb_orders,
     submit_translator_orders,
 )
@@ -86,6 +87,10 @@ def run_pnl(params, cfg: SimConfig | None = None, verbose: bool = False,
     параметрах клиринг CE плохо обусловлен и цены идут вразнос — досчитывать
     такой прогон бессмысленно). None — не проверять.
 
+    Учёт: PnL по маркам cfg.marks ("fair" по умолчанию — цены закрытия:
+    X1 = X2 = 1, Y_v = мид биржи v; "ce" — цены CE), дисперсия базиса для
+    шейдинга арбитражёров — по cfg.arb_vol ("venues" по умолчанию).
+
     Возвращает dict:
         pnl        — {имя агента: PnL в X1 на момент окончания}
         total      — суммарный PnL четырёх агентов
@@ -132,10 +137,8 @@ def run_pnl(params, cfg: SimConfig | None = None, verbose: bool = False,
     equity = np.zeros((n, T + 1))
     rec = _NullRecorder()
 
-    basis_vol = {
-        kind: EwmaVar(cfg.arb_vol_half_life, ce.rate(F.PORTFOLIOS[kind]))
-        for kind in ("AX", "AY")
-    }
+    basis_vol = make_basis_vol(cfg, ce, ex1, ex2)
+    marks = Marks(cfg.marks, ce, ex1, ex2)
 
     # --- основной цикл (как в run_simulation, без записи) ------------------- #
     blown = False
@@ -145,14 +148,13 @@ def run_pnl(params, cfg: SimConfig | None = None, verbose: bool = False,
         submit_translator_orders(cfg, market, ce, agents, gamma)
         submit_arb_orders(cfg, ce, agents, gamma, basis_vol)
         ce.step(dt=1.0)
-        hedge_translators(cfg, market, ce, agents, gamma, rec, t)
+        hedge_translators(cfg, market, ce, agents, gamma, rec, t, marks)
 
         for kind in ("AX", "AY"):
             basis_vol[kind].update(ce.rate(F.PORTFOLIOS[kind]))
 
         for i, a in enumerate(agents):
-            equity[i, t] = (ce.mark_to_market(a.name) if a.active
-                            else equity[i, t - 1])
+            equity[i, t] = marks.value(a.name) if a.active else equity[i, t - 1]
 
         if (blowup_limit is not None
                 and np.abs(equity[:, t]).max() > blowup_limit):
