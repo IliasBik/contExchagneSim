@@ -11,5 +11,10 @@ report/*.out
 report/*.toc
 
 detail_log.jsonl
-opt_log.csv
+opt_log*.csv
 .vscode/
+
+# mean_field.py: калибровка и результаты (пересчитываются запуском)
+mean_field_calib.json
+mean_field_paths.npz
+mean_field_result.json

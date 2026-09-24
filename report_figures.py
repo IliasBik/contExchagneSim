@@ -1051,13 +1051,15 @@ def fig_agents_turnover(run: D.RunData, ph: D.Phases):
 
 
 def fig_agents_structure(run: D.RunData, ph: D.Phases):
-    """Структурная аналитика PnL: переоценка позиции против результата хеджа."""
+    """Структурная аналитика PnL: переоценка, исполнение на CE и результат хеджа."""
     fig, ax = _fig(2, 2, 4.3)
 
     for kind in ("T1", "T2"):
         rows = run.kind_rows(kind)
         ax[0].plot(np.cumsum(run.reval[rows].sum(axis=0)),
                    color=KIND_COLOR[kind], label=f"{kind}: переоценка")
+        ax[0].plot(np.cumsum(run.ce_exec[rows].sum(axis=0)),
+                   color=KIND_COLOR[kind], ls=":", label=f"{kind}: исполнение CE")
         ax[0].plot(np.cumsum(run.hedge_pnl[rows].sum(axis=0)),
                    color=KIND_COLOR[kind], ls="--", label=f"{kind}: хедж")
         ax[0].plot(run.equity[rows].sum(axis=0), color=KIND_COLOR[kind], lw=1.6,
@@ -1072,10 +1074,13 @@ def fig_agents_structure(run: D.RunData, ph: D.Phases):
 
     x = np.arange(len(D.KINDS))
     reval = np.array([run.reval[run.kind_rows(k)].sum() for k in D.KINDS])
+    exec_ = np.array([run.ce_exec[run.kind_rows(k)].sum() for k in D.KINDS])
     hedge = np.array([run.hedge_pnl[run.kind_rows(k)].sum() for k in D.KINDS])
-    ax[1].bar(x - 0.22, reval, width=0.2, color="#4c72b0", label="переоценка позиции")
-    ax[1].bar(x, hedge, width=0.2, color="#dd8452", label="результат хеджа")
-    ax[1].bar(x + 0.22, reval + hedge, width=0.2, color="#55a868", label="итог")
+    ax[1].bar(x - 0.3, reval, width=0.18, color="#4c72b0", label="переоценка позиции")
+    ax[1].bar(x - 0.1, exec_, width=0.18, color="#8172b2", label="исполнение на CE")
+    ax[1].bar(x + 0.1, hedge, width=0.18, color="#dd8452", label="результат хеджа")
+    ax[1].bar(x + 0.3, reval + exec_ + hedge, width=0.18, color="#55a868",
+              label="итог")
     ax[1].axhline(0, color="black", lw=0.7)
     ax[1].set_xticks(x)
     ax[1].set_xticklabels(D.KINDS)
@@ -1084,18 +1089,17 @@ def fig_agents_structure(run: D.RunData, ph: D.Phases):
     ax[1].legend(loc="upper left", fontsize=6.5)
 
     rows_t = np.concatenate([run.kind_rows("T1"), run.kind_rows("T2")])
-    total = run.equity[rows_t, run.T]
     hedge_share = run.hedge_pnl[rows_t].sum(axis=1)
-    reval_share = run.reval[rows_t].sum(axis=1)
+    ce_share = run.reval[rows_t].sum(axis=1) + run.ce_exec[rows_t].sum(axis=1)
     colors = [KIND_COLOR[run.agents[i]["kind"]] for i in rows_t]
-    ax[2].scatter(reval_share, hedge_share, s=20, c=colors, alpha=0.8)
-    lim = np.nanmax(np.abs(np.concatenate([reval_share, hedge_share]))) * 1.1
+    ax[2].scatter(ce_share, hedge_share, s=20, c=colors, alpha=0.8)
+    lim = np.nanmax(np.abs(np.concatenate([ce_share, hedge_share]))) * 1.1
     ax[2].plot([-lim, lim], [lim, -lim], color="black", lw=0.7, ls=":",
                label="нулевой итог")
     ax[2].axhline(0, color="black", lw=0.6)
     ax[2].axvline(0, color="black", lw=0.6)
-    ax[2].set_title("в) Трансляторы: переоценка против хеджа")
-    ax[2].set_xlabel("переоценка позиции, X1")
+    ax[2].set_title("в) Трансляторы: результат на CE против хеджа")
+    ax[2].set_xlabel("исполнение на CE + переоценка, X1")
     ax[2].set_ylabel("результат хеджа, X1")
     ax[2].legend(loc="upper right", fontsize=6.5)
 
